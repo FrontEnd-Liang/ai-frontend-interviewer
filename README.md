@@ -8,16 +8,21 @@
 
 - Next.js 14（App Router） + React 18 + TypeScript
 - TailwindCSS
-- LangChain.js（`@langchain/core` + `@langchain/google-genai`）
+- LangChain.js（`@langchain/core` + `@langchain/google-genai` + `@langchain/pinecone` + `@langchain/textsplitters`）
+- Pinecone（向量数据库，用于 RAG 检索）
 
 ## 目录结构
 
 ```
 app/
-  api/chat/route.ts   # LangChain 后端：System Prompt + 结构化输出
-  layout.tsx          # 根布局
-  page.tsx            # 聊天 UI（用户气泡、AI 卡片、Loading）
-  globals.css         # Tailwind 入口
+  api/chat/route.ts        # LangChain 后端：RAG 检索 + System Prompt + 结构化输出
+  layout.tsx               # 根布局
+  page.tsx                 # 聊天 UI（用户气泡、AI 卡片、Loading）
+  globals.css              # Tailwind 入口
+docs/
+  frontend-handbook.md     # RAG 知识库源文件
+scripts/
+  ingest.ts                # 把手册切分、向量化并写入 Pinecone
 ```
 
 ## 快速开始
@@ -38,11 +43,27 @@ GEMINI_API_KEY=AIxxxxxxxxxxxxxxxxxxxx
 
 # 可选，默认 gemini-2.5-flash
 # GEMINI_MODEL=gemini-2.5-flash
+
+# 国内访问 Google API 必填
+HTTPS_PROXY=http://127.0.0.1:7890
+
+# Pinecone（RAG 必填）
+PINECONE_API_KEY=pcsk_xxxxxxxx
+PINECONE_INDEX=ai-interviewer
 ```
 
-> 在 [Google AI Studio](https://aistudio.google.com/app/apikey) 申请免费 API Key。
+> - Gemini Key：[Google AI Studio](https://aistudio.google.com/app/apikey) 免费申请。
+> - Pinecone：[app.pinecone.io](https://app.pinecone.io) 注册 → 创建 Serverless 索引，**维度 768、metric cosine**（必须，因为 `text-embedding-004` 输出 768 维）。
 
-### 3. 启动开发服务器
+### 3. 向量入库（首次必须执行一次）
+
+```bash
+npm run ingest
+```
+
+该脚本会读取 `docs/frontend-handbook.md`，按 500 字符 / 50 重叠切分，用 `text-embedding-004` 生成向量，覆盖写入 `PINECONE_INDEX` 索引。修改手册后重跑即可同步。
+
+### 4. 启动开发服务器
 
 ```bash
 npm run dev
@@ -51,6 +72,14 @@ npm run dev
 浏览器打开 [http://localhost:3000](http://localhost:3000) 即可使用。
 
 ## 核心实现
+
+### RAG 流程
+
+1. **入库**（`scripts/ingest.ts`）：`frontend-handbook.md` → `RecursiveCharacterTextSplitter` 切块 → Gemini `text-embedding-004` 向量化 → `PineconeStore.fromDocuments` 写入索引。
+2. **检索**（`app/api/chat/route.ts`）：用户问题 → 用同一个 embedding 模型向量化 → `vectorStore.similaritySearch(q, 3)` 召回 Top 3 → 拼成 `[片段1] ... [片段2] ... [片段3]` 注入 System Prompt。
+3. **生成**：把带 Context 的 System Prompt + 用户原问题喂给 `gemini-2.5-flash` 的 `withStructuredOutput`，仍然产出 `{ analysis, knowledgePoints, codeExample }`。
+
+> RAG 只影响 System Prompt 的内容，**完全不改动原有的 JSON Schema 输出约束**。
 
 ### 强制结构化输出
 

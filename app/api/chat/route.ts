@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { SystemMessage, HumanMessage } from "@langchain/core/messages";
+import { Pinecone } from "@pinecone-database/pinecone";
+import { PineconeStore } from "@langchain/pinecone";
+import { GeminiEmbeddings } from "@/lib/embeddings";
 
 export const runtime = "nodejs";
 
@@ -84,7 +87,46 @@ export async function POST(req: NextRequest) {
         { status: 500 }
       );
     }
+    if (!process.env.PINECONE_API_KEY) {
+      return NextResponse.json(
+        { error: "服务器未配置 PINECONE_API_KEY，请检查 .env.local" },
+        { status: 500 }
+      );
+    }
+    if (!process.env.PINECONE_INDEX) {
+      return NextResponse.json(
+        { error: "服务器未配置 PINECONE_INDEX，请检查 .env.local" },
+        { status: 500 }
+      );
+    }
 
+    // ============ RAG：向量检索召回背景知识 ============
+    const embeddings = new GeminiEmbeddings({
+      apiKey: process.env.GEMINI_API_KEY,
+      model: "gemini-embedding-001",
+      outputDimensionality: 768,
+    });
+
+    const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+    const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX);
+    const vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
+      pineconeIndex,
+    });
+
+    const retrieved = await vectorStore.similaritySearch(message, 3);
+    const context = retrieved.length
+      ? retrieved
+          .map((d, i) => `[片段${i + 1}]\n${d.pageContent.trim()}`)
+          .join("\n\n")
+      : "(无可用背景知识)";
+
+    const systemPromptWithContext = `${SYSTEM_PROMPT}
+
+# 背景知识（RAG 召回）
+请优先参考以下提供的背景知识来分析问题和提取知识点：
+${context}`;
+
+    // ============ 生成结构化回答（保留原有强格式化逻辑） ============
     const model = new ChatGoogleGenerativeAI({
       apiKey: process.env.GEMINI_API_KEY,
       model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
@@ -96,14 +138,10 @@ export async function POST(req: NextRequest) {
       { name: "InterviewAnswer" }
     );
 
-    const prompt = ChatPromptTemplate.fromMessages([
-      ["system", SYSTEM_PROMPT],
-      ["human", "{question}"],
+    const result = await structuredModel.invoke([
+      new SystemMessage(systemPromptWithContext),
+      new HumanMessage(message),
     ]);
-
-    const chain = prompt.pipe(structuredModel);
-
-    const result = await chain.invoke({ question: message });
 
     const safe: InterviewAnswer = {
       analysis: typeof result?.analysis === "string" ? result.analysis : "",
