@@ -8,8 +8,13 @@
 
 - Next.js 14（App Router） + React 18 + TypeScript
 - TailwindCSS
-- LangChain.js（`@langchain/core` + `@langchain/google-genai` + `@langchain/pinecone` + `@langchain/textsplitters`）
-- Pinecone（向量数据库，用于 RAG 检索）
+- LangChain.js：
+  - `langchain` + `@langchain/core`（`createToolCallingAgent` + `AgentExecutor`）
+  - `@langchain/google-genai`（Gemini 模型）
+  - `@langchain/pinecone` + `@langchain/textsplitters`（向量检索）
+  - `@langchain/community`（Tavily 搜索工具）
+- Pinecone（向量数据库，存储手册 embedding）
+- Tavily（互联网搜索引擎，可选）
 
 ## 目录结构
 
@@ -50,10 +55,14 @@ HTTPS_PROXY=http://127.0.0.1:7890
 # Pinecone（RAG 必填）
 PINECONE_API_KEY=pcsk_xxxxxxxx
 PINECONE_INDEX=ai-interviewer
+
+# Tavily（互联网搜索，可选；留空则 Agent 只用本地手册一个工具）
+# TAVILY_API_KEY=tvly-xxxxxxxx
 ```
 
 > - Gemini Key：[Google AI Studio](https://aistudio.google.com/app/apikey) 免费申请。
-> - Pinecone：[app.pinecone.io](https://app.pinecone.io) 注册 → 创建 Serverless 索引，**维度 768、metric cosine**（必须，因为 `text-embedding-004` 输出 768 维）。
+> - Pinecone：[app.pinecone.io](https://app.pinecone.io) 注册 → 创建 Serverless 索引，**维度 768、metric cosine**（与 `gemini-embedding-001` 截断到 768 维后对齐）。
+> - Tavily：[app.tavily.com](https://app.tavily.com) 免费层每月 1000 次搜索。
 
 ### 3. 向量入库（首次必须执行一次）
 
@@ -73,17 +82,47 @@ npm run dev
 
 ## 核心实现
 
-### RAG 流程
+### Agentic Workflow（多工具自主路由）
 
-1. **入库**（`scripts/ingest.ts`）：`frontend-handbook.md` → `RecursiveCharacterTextSplitter` 切块 → Gemini `text-embedding-004` 向量化 → `PineconeStore.fromDocuments` 写入索引。
-2. **检索**（`app/api/chat/route.ts`）：用户问题 → 用同一个 embedding 模型向量化 → `vectorStore.similaritySearch(q, 3)` 召回 Top 3 → 拼成 `[片段1] ... [片段2] ... [片段3]` 注入 System Prompt。
-3. **生成**：把带 Context 的 System Prompt + 用户原问题喂给 `gemini-2.5-flash` 的 `withStructuredOutput`，仍然产出 `{ analysis, knowledgePoints, codeExample }`。
+```
+用户问题
+   │
+   ▼
+┌──────────────────────────────────────────────┐
+│ 阶段 A：Tool-Calling Agent (gemini-2.5-flash) │
+│ ─────────────────────────────────────────────│
+│ 自主选择 ▼                                    │
+│ ┌──────────────────┐   ┌──────────────────┐  │
+│ │search_frontend_  │   │internet_search   │  │
+│ │handbook (Pinecone)│   │(Tavily, 可选)   │  │
+│ └────────┬─────────┘   └────────┬─────────┘  │
+│          └────────┬─────────────┘            │
+│                   ▼                          │
+│        Agent 综合后产出自由文本回答          │
+└──────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────┐
+│ 阶段 B：JSON 强格式化（withStructuredOutput）│
+│ → { analysis, knowledgePoints, codeExample } │
+└──────────────────────────────────────────────┘
+                   │
+                   ▼
+            前端卡片渲染
+```
 
-> RAG 只影响 System Prompt 的内容，**完全不改动原有的 JSON Schema 输出约束**。
+1. **入库**（`npm run ingest`）：`frontend-handbook.md` → `RecursiveCharacterTextSplitter`（chunkSize 500 / overlap 50）→ `gemini-embedding-001` 截断到 768 维 → 覆盖写入 Pinecone。
+2. **Agent**（`app/api/chat/route.ts`）：基于 `createToolCallingAgent` + `AgentExecutor` 实现两个工具：
+   - `search_frontend_handbook` — 本地手册 Pinecone topK=3 检索
+   - `internet_search` — Tavily 互联网搜索（仅在 `TAVILY_API_KEY` 配置时启用）
+   - System Prompt 中详细告知工具用途与调用边界，由 Gemini 自主决定走哪一条
+3. **JSON 收敛**：Agent 输出的自由文本 + 原问题 → 再走一次 `gemini-2.5-flash.withStructuredOutput(schema)`，强制返回 `{ analysis, knowledgePoints, codeExample }` 三字段。
 
-### 强制结构化输出
+> 此设计保证：**前端 `page.tsx` 对返回结构的解析不需要任何修改**。
 
-在 `app/api/chat/route.ts` 中通过 `ChatPromptTemplate` 注入面试官人设，并使用 LangChain 的 **`.withStructuredOutput(schema)`** 把 Gemini 的输出绑定到 JSON Schema 上：
+### 强制结构化输出（阶段 B）
+
+使用 LangChain 的 **`.withStructuredOutput(schema)`** 把 Gemini 的输出绑定到 JSON Schema 上：
 
 ```ts
 {
@@ -93,7 +132,7 @@ npm run dev
 }
 ```
 
-`withStructuredOutput` 底层会调用 Gemini 的 **Function Calling / Response Schema** 能力，比单纯 Prompt 约束更稳定。同时服务端再做一次字段类型兜底校验，避免脏数据打挂前端。
+`withStructuredOutput` 底层调用 Gemini 的 **Function Calling / Response Schema** 能力，比单纯 Prompt 约束更稳定。同时服务端再做一次字段类型兜底校验，避免脏数据打挂前端。
 
 ### UI 卡片渲染
 

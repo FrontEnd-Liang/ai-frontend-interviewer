@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
+import { z } from "zod";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { tool } from "@langchain/core/tools";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { SystemMessage, HumanMessage } from "@langchain/core/messages";
+import { AgentExecutor, createToolCallingAgent } from "langchain/agents";
+import { TavilySearchResults } from "@langchain/community/tools/tavily_search";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { PineconeStore } from "@langchain/pinecone";
 import { GeminiEmbeddings } from "@/lib/embeddings";
@@ -33,10 +38,8 @@ export interface InterviewAnswer {
   codeExample: string;
 }
 
-const SYSTEM_PROMPT = `你是一名资深的"前端技术面试官"，擅长 JavaScript / TypeScript / React / Vue / 浏览器原理 / 工程化 / 性能优化等领域。
-
-# 你的任务
-针对用户提出的前端问题，给出一段精炼、专业、面试场景化的回答。
+// 阶段 B 使用：把任意自由文本格式化为受约束的 JSON
+const FORMATTER_SYSTEM_PROMPT = `你是一名资深的"前端技术面试官"，现在的任务是把已经整理好的回答格式化为结构化 JSON 输出。
 
 # 输出字段约束（强制）
 - analysis: 对该前端问题的简短技术分析（2~5 句话，中文）
@@ -46,7 +49,9 @@ const SYSTEM_PROMPT = `你是一名资深的"前端技术面试官"，擅长 Jav
 # 其它约束
 - 字段名必须完全一致：analysis / knowledgePoints / codeExample。
 - 不能输出多余字段。
-- 若用户提问与前端无关，仍然以面试官身份礼貌引导回前端话题，但仍要返回上述结构化数据。`;
+- 必须严格忠于"已收集到的资料"，不要凭空编造或加入未提及的事实。
+- 若资料中包含代码片段，提炼一段最具代表性的放入 codeExample。
+- 若用户提问与前端无关，仍以面试官身份引导回前端话题，但仍按上述结构输出。`;
 
 const answerSchema = {
   type: "object",
@@ -69,6 +74,24 @@ const answerSchema = {
   },
   required: ["analysis", "knowledgePoints", "codeExample"],
 } as const;
+
+function buildAgentSystemPrompt(hasInternet: boolean): string {
+  const toolMenu = hasInternet
+    ? `- search_frontend_handbook：本地手册（React Fiber、浏览器事件循环、闭包陷阱等已沉淀的核心知识点）。优先调用。
+- internet_search：互联网搜索。仅当问题涉及最新框架版本、近期新闻、本地手册查不到的话题时调用。`
+    : `- search_frontend_handbook：本地手册（React Fiber、浏览器事件循环、闭包陷阱等已沉淀的核心知识点）。
+- （互联网搜索工具未启用，本次只能基于本地手册回答）`;
+
+  return `你是一名资深的前端面试官，具备工具调度能力。
+
+# 可用工具
+${toolMenu}
+
+# 工作流程
+1. 先分析用户的问题属于哪一类，自主选择是否调用工具、调用哪些工具。
+2. 可以串行调用多个工具组合信息；信息已足够时直接回答。
+3. 输出一段简洁、有条理、含必要技术细节的自由文本（无需 JSON 格式，后续会有专门步骤把你的回答结构化）。`;
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -100,56 +123,147 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ============ RAG：向量检索召回背景知识 ============
+    // ============================================================
+    // 共享资源：Embeddings + Pinecone 向量库
+    // ============================================================
     const embeddings = new GeminiEmbeddings({
       apiKey: process.env.GEMINI_API_KEY,
       model: "gemini-embedding-001",
       outputDimensionality: 768,
     });
-
     const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
     const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX);
     const vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
       pineconeIndex,
     });
 
-    const retrieved = await vectorStore.similaritySearch(message, 3);
-    const context = retrieved.length
-      ? retrieved
+    // ============================================================
+    // Tool 1：本地手册检索（Pinecone topK=3）
+    // ============================================================
+    const handbookTool = tool(
+      async ({ query }) => {
+        const docs = await vectorStore.similaritySearch(query, 3);
+        if (!docs.length) return "本地手册中暂无相关内容。";
+        return docs
           .map((d, i) => `[片段${i + 1}]\n${d.pageContent.trim()}`)
-          .join("\n\n")
-      : "(无可用背景知识)";
+          .join("\n\n");
+      },
+      {
+        name: "search_frontend_handbook",
+        description:
+          "当你需要查询 React 原理、闭包陷阱、前端工程化、浏览器机制等本地手册知识时，调用此工具。",
+        schema: z.object({
+          query: z.string().describe("要在本地手册中检索的关键词或前端技术问题"),
+        }),
+      }
+    );
 
-    const systemPromptWithContext = `${SYSTEM_PROMPT}
+    // ============================================================
+    // Tool 2：Tavily 互联网搜索（仅在 TAVILY_API_KEY 配置时启用）
+    // ============================================================
+    const tools: Array<typeof handbookTool> = [handbookTool];
 
-# 背景知识（RAG 召回）
-请优先参考以下提供的背景知识来分析问题和提取知识点：
-${context}`;
+    const hasInternet = Boolean(process.env.TAVILY_API_KEY?.trim());
+    if (hasInternet) {
+      const tavily = new TavilySearchResults({
+        apiKey: process.env.TAVILY_API_KEY,
+        maxResults: 3,
+      });
+      const internetTool = tool(
+        async ({ query }) => {
+          const raw = await tavily.invoke(query);
+          return typeof raw === "string" ? raw : JSON.stringify(raw);
+        },
+        {
+          name: "internet_search",
+          description:
+            "当用户询问最新的前端技术趋势（如 2026 年最新框架）、外部新闻，或本地手册查不到的内容时，调用此工具。",
+          schema: z.object({
+            query: z.string().describe("要在互联网上搜索的关键词或问题"),
+          }),
+        }
+      );
+      tools.push(internetTool);
+    } else {
+      console.warn(
+        "[/api/chat] TAVILY_API_KEY 未配置，internet_search 已禁用，本次仅可使用本地手册。"
+      );
+    }
 
-    // ============ 生成结构化回答（保留原有强格式化逻辑） ============
+    // ============================================================
+    // 阶段 A：Agent 自主调度工具，产出自由文本回答
+    // ============================================================
     const model = new ChatGoogleGenerativeAI({
       apiKey: process.env.GEMINI_API_KEY,
       model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
       temperature: 0.3,
     });
 
+    const agentPrompt = ChatPromptTemplate.fromMessages([
+      ["system", buildAgentSystemPrompt(hasInternet)],
+      ["human", "{input}"],
+      ["placeholder", "{agent_scratchpad}"],
+    ]);
+
+    const agent = await createToolCallingAgent({
+      llm: model,
+      tools,
+      prompt: agentPrompt,
+    });
+    const executor = new AgentExecutor({
+      agent,
+      tools,
+      maxIterations: 5,
+      returnIntermediateSteps: true,
+    });
+
+    const agentResult = await executor.invoke({ input: message });
+    const rawAnswer = String(agentResult?.output ?? "").trim();
+
+    // 把 Agent 调用了哪些工具打印到服务器日志，便于验证路由
+    const calledTools: string[] = Array.isArray(agentResult?.intermediateSteps)
+      ? agentResult.intermediateSteps
+          .map(
+            (step: { action?: { tool?: string } }) => step?.action?.tool ?? ""
+          )
+          .filter((name: string) => name.length > 0)
+      : [];
+    console.log(
+      `[/api/chat] 🛠 tools used:`,
+      calledTools.length ? calledTools : "(none, 模型直接回答)"
+    );
+
+    // ============================================================
+    // 阶段 B：把 Agent 的自由文本强制折成 { analysis, knowledgePoints, codeExample }
+    // ============================================================
     const structuredModel = model.withStructuredOutput<InterviewAnswer>(
       answerSchema,
       { name: "InterviewAnswer" }
     );
 
-    const result = await structuredModel.invoke([
-      new SystemMessage(systemPromptWithContext),
-      new HumanMessage(message),
+    const formatterUserContent = `# 原始问题
+${message}
+
+# 已收集到的资料（Agent 已自主调用工具检索整理）
+${rawAnswer || "(Agent 未提供文字回答，请基于你已有的前端知识回答原始问题。)"}
+
+请基于以上资料，严格按字段约束输出结构化 JSON。`;
+
+    const finalResult = await structuredModel.invoke([
+      new SystemMessage(FORMATTER_SYSTEM_PROMPT),
+      new HumanMessage(formatterUserContent),
     ]);
 
     const safe: InterviewAnswer = {
-      analysis: typeof result?.analysis === "string" ? result.analysis : "",
-      knowledgePoints: Array.isArray(result?.knowledgePoints)
-        ? result.knowledgePoints.filter((s) => typeof s === "string")
+      analysis:
+        typeof finalResult?.analysis === "string" ? finalResult.analysis : "",
+      knowledgePoints: Array.isArray(finalResult?.knowledgePoints)
+        ? finalResult.knowledgePoints.filter((s) => typeof s === "string")
         : [],
       codeExample:
-        typeof result?.codeExample === "string" ? result.codeExample : "",
+        typeof finalResult?.codeExample === "string"
+          ? finalResult.codeExample
+          : "",
     };
 
     return NextResponse.json(safe);

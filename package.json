@@ -10,22 +10,25 @@
     "ingest": "tsx scripts/ingest.ts"
   },
   "dependencies": {
+    "@langchain/community": "^0.3.59",
     "@langchain/core": "^0.3.30",
     "@langchain/google-genai": "^0.1.12",
     "@langchain/pinecone": "^0.2.0",
     "@langchain/textsplitters": "^0.1.0",
     "@pinecone-database/pinecone": "^5.1.2",
+    "langchain": "^0.3.37",
     "next": "14.2.15",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "undici": "^7.25.0"
+    "undici": "^7.25.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "autoprefixer": "^10.4.20",
-    "dotenv": "^17.4.2",
+    "dotenv": "^16.6.1",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.13",
     "tsx": "^4.21.0",
