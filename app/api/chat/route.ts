@@ -3,9 +3,7 @@ import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { z } from "zod";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { tool } from "@langchain/core/tools";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
-import { SystemMessage, HumanMessage } from "@langchain/core/messages";
-import { AgentExecutor, createToolCallingAgent } from "langchain/agents";
+import { SystemMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import { TavilySearchResults } from "@langchain/community/tools/tavily_search";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { PineconeStore } from "@langchain/pinecone";
@@ -38,20 +36,22 @@ export interface InterviewAnswer {
   codeExample: string;
 }
 
-// 阶段 B 使用：把任意自由文本格式化为受约束的 JSON
-const FORMATTER_SYSTEM_PROMPT = `你是一名资深的"前端技术面试官"，现在的任务是把已经整理好的回答格式化为结构化 JSON 输出。
+// 阶段 B 使用：把任意自由文本 / 工具原始返回内容格式化为受约束的 JSON。
+// 注意：刻意保持中立的"内容转换器"语气，**不引入任何身份/拒答倾向**，
+// 否则模型会在用户问天气/股票时擅自插入"我是面试官，不答外部话题"的话术，
+// 把阶段 A 拿到的真实工具结果全部覆盖掉。
+const FORMATTER_SYSTEM_PROMPT = `你是一个内容到 JSON 的纯转换器。
+将下方"已收集到的资料"忠实地折叠进以下 schema：
 
-# 输出字段约束（强制）
-- analysis: 对该前端问题的简短技术分析（2~5 句话，中文）
-- knowledgePoints: 涉及的核心知识点，3~6 个，简短词组（字符串数组）
-- codeExample: 相关的极简代码示例；若该问题不适合示例代码，则返回空字符串 ""
+- analysis: 对原始问题的简短分析或答案（2~5 句话，中文）
+- knowledgePoints: 涉及的核心知识点 / 关键词，3~6 个，简短词组（字符串数组）
+- codeExample: 资料中最具代表性的极简代码示例；没有合适代码则返回空字符串 ""
 
-# 其它约束
-- 字段名必须完全一致：analysis / knowledgePoints / codeExample。
-- 不能输出多余字段。
-- 必须严格忠于"已收集到的资料"，不要凭空编造或加入未提及的事实。
-- 若资料中包含代码片段，提炼一段最具代表性的放入 codeExample。
-- 若用户提问与前端无关，仍以面试官身份引导回前端话题，但仍按上述结构输出。`;
+硬约束：
+- 字段名必须完全一致：analysis / knowledgePoints / codeExample
+- 不允许输出多余字段
+- 必须严格忠于资料，不要编造资料中未出现的事实
+- **不要扮演任何角色、不要拒答、不要附加道德/范围提醒**，只做格式转换`;
 
 const answerSchema = {
   type: "object",
@@ -75,22 +75,19 @@ const answerSchema = {
   required: ["analysis", "knowledgePoints", "codeExample"],
 } as const;
 
-function buildAgentSystemPrompt(hasInternet: boolean): string {
-  const toolMenu = hasInternet
-    ? `- search_frontend_handbook：本地手册（React Fiber、浏览器事件循环、闭包陷阱等已沉淀的核心知识点）。优先调用。
-- internet_search：互联网搜索。仅当问题涉及最新框架版本、近期新闻、本地手册查不到的话题时调用。`
-    : `- search_frontend_handbook：本地手册（React Fiber、浏览器事件循环、闭包陷阱等已沉淀的核心知识点）。
-- （互联网搜索工具未启用，本次只能基于本地手册回答）`;
-
-  return `你是一名资深的前端面试官，具备工具调度能力。
-
-# 可用工具
-${toolMenu}
-
-# 工作流程
-1. 先分析用户的问题属于哪一类，自主选择是否调用工具、调用哪些工具。
-2. 可以串行调用多个工具组合信息；信息已足够时直接回答。
-3. 输出一段简洁、有条理、含必要技术细节的自由文本（无需 JSON 格式，后续会有专门步骤把你的回答结构化）。`;
+function buildRouterSystemPrompt(hasInternet: boolean): string {
+  // 获取当前北京时间的绝对坐标
+  const today = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+  if (!hasInternet) {
+    return `你是一个无情的工具路由机器。
+遇到 [闭包,React,原理,Fiber,事件循环,Vue,浏览器,工程化,性能,内存] → 必须调用 search_frontend_handbook。
+禁止任何解释或闲聊，直接返回工具调用指令。`;
+  }
+  return `当前系统绝对时间：${today}。
+你是一个无情的工具路由机器。
+遇到 [天气,股票,新闻,最新,2025,2026] 必须调用 internet_search；
+遇到 [闭包,React,原理] 必须调用 search_frontend_handbook。
+禁止任何解释或闲聊，直接返回工具调用指令。`;
 }
 
 export async function POST(req: NextRequest) {
@@ -177,7 +174,7 @@ export async function POST(req: NextRequest) {
         {
           name: "internet_search",
           description:
-            "当用户询问最新的前端技术趋势（如 2026 年最新框架）、外部新闻，或本地手册查不到的内容时，调用此工具。",
+            "一个全能的互联网搜索引擎。当用户询问任何关于天气、股票、新闻、实时数据、2025/2026最新信息，或一切本地查不到的事实时，必须调用此工具。",
           schema: z.object({
             query: z.string().describe("要在互联网上搜索的关键词或问题"),
           }),
@@ -191,50 +188,86 @@ export async function POST(req: NextRequest) {
     }
 
     // ============================================================
-    // 阶段 A：Agent 自主调度工具，产出自由文本回答
+    // 阶段 A：原生 bindTools 路由 —— 单步 invoke + 手动派发
+    // 不再使用 AgentExecutor / createToolCallingAgent：
+    //   1. 不让模型进入"自我反思 → 二次总结"的多轮循环（慢 & 触发限流）
+    //   2. 不让模型拿到工具结果后用自然语言"复述"，导致角色拒答覆盖真实数据
+    //   3. 工具原始输出直接作为 rawAnswer，由阶段 B 折成 JSON
     // ============================================================
     const model = new ChatGoogleGenerativeAI({
       apiKey: process.env.GEMINI_API_KEY,
-      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      temperature: 0.3,
+      model: "gemini-2.5-flash",
+      temperature: 0,
+      maxRetries: 2,
     });
 
-    const agentPrompt = ChatPromptTemplate.fromMessages([
-      ["system", buildAgentSystemPrompt(hasInternet)],
-      ["human", "{input}"],
-      ["placeholder", "{agent_scratchpad}"],
+    console.log(
+      "✅ 已经向大模型注册的真实工具清单:",
+      tools.map((t) => t.name)
+    );
+
+    const modelWithTools = model.bindTools(tools);
+
+    const aiMsg = await modelWithTools.invoke([
+      new SystemMessage(buildRouterSystemPrompt(hasInternet)),
+      new HumanMessage(message),
     ]);
 
-    const agent = await createToolCallingAgent({
-      llm: model,
-      tools,
-      prompt: agentPrompt,
-    });
-    const executor = new AgentExecutor({
-      agent,
-      tools,
-      maxIterations: 5,
-      returnIntermediateSteps: true,
-    });
+    const toolCalls = Array.isArray(aiMsg.tool_calls) ? aiMsg.tool_calls : [];
+    const calledTools: string[] = [];
+    let rawAnswer: string;
 
-    const agentResult = await executor.invoke({ input: message });
-    const rawAnswer = String(agentResult?.output ?? "").trim();
+    if (toolCalls.length > 0) {
+      // 模型决定调用工具：在本地手动执行，**不**把工具结果再送回模型二次总结。
+      const toolOutputs: string[] = [];
+      for (const tc of toolCalls) {
+        const matched = tools.find((t) => t.name === tc.name);
+        if (!matched) {
+          console.warn(`[/api/chat] 模型试图调用未注册的工具: ${tc.name}`);
+          continue;
+        }
+        calledTools.push(tc.name);
+        try {
+          // 把完整 ToolCall 传进去（LangChain 会自动用 zod 校验 tc.args），
+          // 返回值会被包成 ToolMessage —— 真正的字符串内容在 .content 上。
+          const out = await matched.invoke(tc);
+          const rawContent =
+            out instanceof ToolMessage ? out.content : out;
+          const outStr =
+            typeof rawContent === "string"
+              ? rawContent
+              : JSON.stringify(rawContent);
+          toolOutputs.push(
+            `# 工具 [${tc.name}] · 入参 ${JSON.stringify(tc.args)}\n${outStr}`
+          );
+        } catch (toolErr) {
+          const m = toolErr instanceof Error ? toolErr.message : String(toolErr);
+          console.warn(`[/api/chat] 工具 ${tc.name} 调用失败: ${m}`);
+          toolOutputs.push(`# 工具 [${tc.name}] 调用失败: ${m}`);
+        }
+      }
+      rawAnswer = toolOutputs.join("\n\n---\n\n").trim();
+    } else {
+      // 模型没决定调用工具（通常是日常问候 / 模型自评不需要外部信息）
+      rawAnswer =
+        typeof aiMsg.content === "string"
+          ? aiMsg.content
+          : JSON.stringify(aiMsg.content);
+    }
 
-    // 把 Agent 调用了哪些工具打印到服务器日志，便于验证路由
-    const calledTools: string[] = Array.isArray(agentResult?.intermediateSteps)
-      ? agentResult.intermediateSteps
-          .map(
-            (step: { action?: { tool?: string } }) => step?.action?.tool ?? ""
-          )
-          .filter((name: string) => name.length > 0)
-      : [];
     console.log(
-      `[/api/chat] 🛠 tools used:`,
-      calledTools.length ? calledTools : "(none, 模型直接回答)"
+      `[/api/chat] 🛠 tools used: ${
+        calledTools.length
+          ? `[${calledTools.join(", ")}]`
+          : "(none, 模型直接回答)"
+      }`
     );
 
     // ============================================================
     // 阶段 B：把 Agent 的自由文本强制折成 { analysis, knowledgePoints, codeExample }
+    // 注意：此处 **绝对不能** 把 catch 到的错误向上抛 —— 否则前端拿到 500，
+    // 阶段 A 已经辛苦拿到的 rawAnswer 就全废了。所以本块独立 try/catch，
+    // 任何失败（429 限流 / 网络抖动 / Schema 不合规 …）都走"降级兜底"。
     // ============================================================
     const structuredModel = model.withStructuredOutput<InterviewAnswer>(
       answerSchema,
@@ -249,22 +282,54 @@ ${rawAnswer || "(Agent 未提供文字回答，请基于你已有的前端知识
 
 请基于以上资料，严格按字段约束输出结构化 JSON。`;
 
-    const finalResult = await structuredModel.invoke([
-      new SystemMessage(FORMATTER_SYSTEM_PROMPT),
-      new HumanMessage(formatterUserContent),
-    ]);
+    let safe: InterviewAnswer;
+    try {
+      const finalResult = await structuredModel.invoke([
+        new SystemMessage(FORMATTER_SYSTEM_PROMPT),
+        new HumanMessage(formatterUserContent),
+      ]);
 
-    const safe: InterviewAnswer = {
-      analysis:
-        typeof finalResult?.analysis === "string" ? finalResult.analysis : "",
-      knowledgePoints: Array.isArray(finalResult?.knowledgePoints)
-        ? finalResult.knowledgePoints.filter((s) => typeof s === "string")
-        : [],
-      codeExample:
-        typeof finalResult?.codeExample === "string"
-          ? finalResult.codeExample
-          : "",
-    };
+      safe = {
+        analysis:
+          typeof finalResult?.analysis === "string" ? finalResult.analysis : "",
+        knowledgePoints: Array.isArray(finalResult?.knowledgePoints)
+          ? finalResult.knowledgePoints.filter((s) => typeof s === "string")
+          : [],
+        codeExample:
+          typeof finalResult?.codeExample === "string"
+            ? finalResult.codeExample
+            : "",
+      };
+
+      // 双重保险：模型偶尔会返回 schema 合规但全空字符串。这种情况也走兜底。
+      if (!safe.analysis && !safe.knowledgePoints.length && !safe.codeExample) {
+        throw new Error("structured output 全字段为空");
+      }
+    } catch (formatterErr) {
+      const errMsg =
+        formatterErr instanceof Error
+          ? formatterErr.message
+          : String(formatterErr);
+      const is429 = /429|rate.?limit|quota|too many|resource_exhausted/i.test(
+        errMsg
+      );
+      console.warn(
+        `[/api/chat] ⚠️ 阶段 B 格式化失败${
+          is429 ? "（429 限流）" : ""
+        }，启用降级兜底：${errMsg}`
+      );
+
+      const fallbackAnalysis =
+        (rawAnswer ||
+          "AI 在阶段 A 也未能产生有效回答，请稍后再试或换个问法。") +
+        "\n\n(注：系统当前触发 API 限流，此为降级展示)";
+
+      safe = {
+        analysis: fallbackAnalysis,
+        knowledgePoints: ["服务限流兜底"],
+        codeExample: "",
+      };
+    }
 
     return NextResponse.json(safe);
   } catch (err: unknown) {
