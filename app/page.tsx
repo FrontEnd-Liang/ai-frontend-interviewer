@@ -30,12 +30,11 @@ export default function HomePage() {
     });
   }, [messages, loading]);
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    const question = input.trim();
-    if (!question || loading) return;
+  async function sendQuestion(question: string) {
+    const trimmed = question.trim();
+    if (!trimmed || loading) return;
 
-    const userMsg: Message = { id: uid(), role: "user", content: question };
+    const userMsg: Message = { id: uid(), role: "user", content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setLoading(true);
@@ -44,7 +43,7 @@ export default function HomePage() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: question }),
+        body: JSON.stringify({ message: trimmed }),
       });
 
       const data = await res.json();
@@ -71,6 +70,11 @@ export default function HomePage() {
     }
   }
 
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    void sendQuestion(input);
+  }
+
   return (
     <main className="flex h-screen flex-col items-center bg-[#f7f7f8]">
       <header className="w-full border-b border-gray-200 bg-white">
@@ -94,7 +98,9 @@ export default function HomePage() {
         className="w-full flex-1 overflow-y-auto"
       >
         <div className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-6">
-          {messages.length === 0 && !loading && <EmptyState />}
+          {messages.length === 0 && !loading && (
+            <EmptyState onSelect={sendQuestion} />
+          )}
 
           {messages.map((m) => (
             <MessageBubble key={m.id} message={m} />
@@ -139,7 +145,7 @@ export default function HomePage() {
   );
 }
 
-function EmptyState() {
+function EmptyState({ onSelect }: { onSelect: (q: string) => void }) {
   const examples = [
     "什么是闭包？请举一个常见使用场景。",
     "讲一下浏览器事件循环（Event Loop）。",
@@ -159,12 +165,14 @@ function EmptyState() {
       </p>
       <div className="mt-6 grid w-full max-w-xl grid-cols-1 gap-2 sm:grid-cols-2">
         {examples.map((q) => (
-          <div
+          <button
             key={q}
-            className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-left text-sm text-gray-700"
+            type="button"
+            onClick={() => onSelect(q)}
+            className="cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-2 text-left text-sm text-gray-700 transition-colors hover:border-gray-400 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-900/20"
           >
             {q}
-          </div>
+          </button>
         ))}
       </div>
     </div>

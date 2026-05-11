@@ -10,10 +10,11 @@
   },
   "dependencies": {
     "@langchain/core": "^0.3.30",
-    "@langchain/google-genai": "^0.1.6",
+    "@langchain/google-genai": "^0.1.12",
     "next": "14.2.15",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "undici": "^7.25.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",

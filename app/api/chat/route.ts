@@ -1,8 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 
 export const runtime = "nodejs";
+
+// Node 18+ 的原生 fetch（undici）默认不读 HTTPS_PROXY/HTTP_PROXY，
+// 在国内访问 Google API 必须显式注入代理，否则会 fetch failed / 超时。
+const proxyUrl =
+  process.env.HTTPS_PROXY ||
+  process.env.https_proxy ||
+  process.env.HTTP_PROXY ||
+  process.env.http_proxy;
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __proxyDispatcherConfigured: boolean | undefined;
+}
+
+if (proxyUrl && !globalThis.__proxyDispatcherConfigured) {
+  setGlobalDispatcher(new ProxyAgent(proxyUrl));
+  globalThis.__proxyDispatcherConfigured = true;
+  console.log(`[/api/chat] using proxy: ${proxyUrl}`);
+}
 
 export interface InterviewAnswer {
   analysis: string;
