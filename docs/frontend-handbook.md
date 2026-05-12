@@ -21,3 +21,20 @@ JavaScript 是单线程语言，必须依靠 Event Loop 机制来调度和处理
 闭包允许内部函数持续访问其词法作用域内的外部变量。在实际工程中，极易引发严重问题：
 - **经典场景：React Hooks 中的过期闭包 (Stale Closure)**。在 `useEffect`、`useCallback` 或 `setInterval` 回调中，如果依赖项数组（deps）未准确填写，内部函数捕获到的 state 永远是组件初次渲染或某次历史渲染时的旧值。
 - **内存泄漏：未销毁的事件监听与定时器**。在单页应用 (SPA) 中，如果组件卸载时（如 `useEffect` 的 cleanup 函数中）未调用 `clearInterval` 或 `removeEventListener`，由于闭包对 DOM 元素或大型数据对象的隐式引用，导致浏览器的垃圾回收器 (GC) 永远无法释放这块内存，最终造成页面卡顿甚至崩溃。
+**经典代码示例（React 过期闭包）：**
+```javascript
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      // 闭包陷阱：由于 deps 为空数组，内部函数捕获的 count 永远是初次渲染的 0
+      console.log('当前 count:', count); 
+    }, 1000);
+    
+    // 必须清理定时器，否则导致内存泄漏
+    return () => clearInterval(timer);
+  }, []); // 依赖项缺失
+
+  return <button onClick={() => setCount(c => c + 1)}>加一</button>;
+}
