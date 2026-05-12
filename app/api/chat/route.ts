@@ -93,6 +93,16 @@ function buildRouterSystemPrompt(hasInternet: boolean): string {
 export async function POST(req: NextRequest) {
   try {
     const { message } = (await req.json()) as { message?: string };
+    // 【新增：物理防线与短路路由】
+    // 拦截无意义的打招呼，直接返回标准 JSON，彻底绕过大模型，防止空包崩溃并节约 API 额度
+    const greetingRegex = /^(你好|在吗|哈喽|hello|hi|测试|滴滴)$/i;
+    if (message && greetingRegex.test(message.trim())) {
+      return NextResponse.json({
+        analysis: "您好！我是您的专属前端技术面试官 AI。我已经准备就绪，您可以问我任何关于前端八股文（如闭包、React Fiber、微前端架构）的问题，或者向我打听 2026 年最新的技术趋势与实时资讯。",
+        knowledgePoints: ["系统就绪", "日常交互"],
+        codeExample: ""
+      });
+    }
 
     if (!message || typeof message !== "string" || !message.trim()) {
       return NextResponse.json(
