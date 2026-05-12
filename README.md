@@ -1,5 +1,15 @@
 # 前端面试官 · AI 智能体架构 (Agentic Workflow)
 
+## 📺 项目演示 (Demo)
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/dea2dc8c-7008-47c9-a3c0-39f2ece4af31" width="100%" controls autoplay loop muted>
+    您的浏览器不支持 HTML5 视频，请点击<a href="https://github.com/user-attachments/assets/dea2dc8c-7008-47c9-a3c0-39f2ece4af31">此处</a>查看演示。
+  </video>
+</div>
+
+> **注：** 右侧终端实时展示了 Agent 的路由决策逻辑（如 `internet_search` 调用及物理层拦截日志）。
+
 一个基于现代化多智能体协作流（Agentic Workflow）的前端技术问答平台。系统摒弃了传统的线性问答，利用原生 Tool Calling 能力，实现了本地私有知识库（RAG）与实时互联网数据的混合检索与精准路由。
 
 > **底层驱动：Google Gemini（推荐 `gemini-1.5-flash`）**，通过 `@langchain/google-genai` 原生接入。
