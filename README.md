@@ -1,33 +1,31 @@
-# 前端面试官 · AI 问答工具（第一阶段单点突破）
+# 前端面试官 · AI 智能体架构 (Agentic Workflow)
 
-一个极简的 AI 问答 Demo：内置「前端技术面试官」System Prompt，强制大模型以 JSON 结构化输出，前端解析为卡片展示。
+一个基于现代化多智能体协作流（Agentic Workflow）的前端技术问答平台。系统摒弃了传统的线性问答，利用原生 Tool Calling 能力，实现了本地私有知识库（RAG）与实时互联网数据的混合检索与精准路由。
 
-> **底层模型：Google Gemini（`gemini-2.5-flash`）**，通过 `@langchain/google-genai` 接入。
+> **底层驱动：Google Gemini（推荐 `gemini-1.5-flash`）**，通过 `@langchain/google-genai` 原生接入。
 
-## 技术栈
+## 🛠 技术栈与核心基建
 
-- Next.js 14（App Router） + React 18 + TypeScript
-- TailwindCSS
-- LangChain.js：
-  - `langchain` + `@langchain/core`（`createToolCallingAgent` + `AgentExecutor`）
-  - `@langchain/google-genai`（Gemini 模型）
-  - `@langchain/pinecone` + `@langchain/textsplitters`（向量检索）
-  - `@langchain/community`（Tavily 搜索工具）
-- Pinecone（向量数据库，存储手册 embedding）
-- Tavily（互联网搜索引擎，可选）
+- **前端框架**：Next.js 14（App Router） + React 18 + TypeScript + TailwindCSS
+- **AI 编排引擎**：LangChain.js
+  - 核心调度：`@langchain/core`（使用原生 `bindTools` 实现零冗余单步路由）
+  - 模型接入：`@langchain/google-genai`
+  - 向量切分：`@langchain/textsplitters`
+- **基础设施**：
+  - **Pinecone**：Serverless 向量数据库（用于存储与检索前端底层原理）
+  - **Tavily**：实时互联网搜索引擎（用于获取 2026 年最新前沿技术与实时物理数据）
 
-## 目录结构
+## 📂 目录结构
 
-```
+```text
 app/
-  api/chat/route.ts        # LangChain 后端：RAG 检索 + System Prompt + 结构化输出
+  api/chat/route.ts        # Agent 核心大脑：意图拦截 + 原生 Tool Calling + 降级兜底
   layout.tsx               # 根布局
-  page.tsx                 # 聊天 UI（用户气泡、AI 卡片、Loading）
-  globals.css              # Tailwind 入口
+  page.tsx                 # 聊天 UI（流式无缝渲染、结构化卡片展示）
 docs/
-  frontend-handbook.md     # RAG 知识库源文件
+  frontend-handbook.md     # RAG 私有知识库源文件
 scripts/
-  ingest.ts                # 把手册切分、向量化并写入 Pinecone
+  ingest.ts                # 自动化数据向量化与 Pinecone 写入脚本
 ```
 
 ## 快速开始
@@ -85,30 +83,36 @@ npm run dev
 ### Agentic Workflow（多工具自主路由）
 
 ```
-用户问题
+[用户提问]
+   │
+   ├─► 物理层正则拦截 (如"你好") ──(短路返回)──► [响应 JSON] ⚡ 极速 0 成本
    │
    ▼
-┌──────────────────────────────────────────────┐
-│ 阶段 A：Tool-Calling Agent (gemini-2.5-flash) │
-│ ─────────────────────────────────────────────│
-│ 自主选择 ▼                                    │
-│ ┌──────────────────┐   ┌──────────────────┐  │
-│ │search_frontend_  │   │internet_search   │  │
-│ │handbook (Pinecone)│   │(Tavily, 可选)   │  │
-│ └────────┬─────────┘   └────────┬─────────┘  │
-│          └────────┬─────────────┘            │
-│                   ▼                          │
-│        Agent 综合后产出自由文本回答          │
-└──────────────────────────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────────────────────┐
-│ 阶段 B：JSON 强格式化（withStructuredOutput）│
-│ → { analysis, knowledgePoints, codeExample } │
-└──────────────────────────────────────────────┘
-                   │
-                   ▼
-            前端卡片渲染
+┌────────────────────────────────────────────────────────┐
+│ 阶段 A：Native Tool-Calling Router (大模型原生意图分发)│
+│ (注入系统绝对时间戳，消除大模型"时间盲视"预测幻觉)     │
+│ ───────────────────────────────────────────────────────│
+│ 动态绑定 ▼                                             │
+│ ┌──────────────────┐   ┌──────────────────┐            │
+│ │search_frontend_  │   │internet_search   │            │
+│ │handbook(Pinecone)│   │(Tavily 泛搜索)   │            │
+│ └────────┬─────────┘   └────────┬─────────┘            │
+│          └──────────────┬───────┘                      │
+│                         ▼                              │
+│       Node.js 后端手动执行工具，获取 Raw Text          │
+└─────────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+┌────────────────────────────────────────────────────────┐
+│ 阶段 B：Format 强制收敛 (withStructuredOutput)         │
+│ ───────────────────────────────────────────────────────│
+│ 将杂乱的工具返回值/自由文本，严格折叠为前端可用 UI 字段│
+│ { analysis, knowledgePoints, codeExample }             │
+│                                                        │
+│ 🛡️ 容灾兜底 (Fallback)：                               │
+│ 若触发 429 额度限流或 API 宕机，拦截 500 报错，        │
+│ 强行组装降级 JSON，保障 C 端前端页面永不崩溃。         │
+└────────────────────────────────────────────────────────┘
 ```
 
 1. **入库**（`npm run ingest`）：`frontend-handbook.md` → `RecursiveCharacterTextSplitter`（chunkSize 500 / overlap 50）→ `gemini-embedding-001` 截断到 768 维 → 覆盖写入 Pinecone。
