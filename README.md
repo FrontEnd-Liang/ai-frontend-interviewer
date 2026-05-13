@@ -12,7 +12,7 @@
 
 一个基于现代化多智能体协作流（Agentic Workflow）的前端技术问答平台。系统摒弃了传统的线性问答，利用原生 Tool Calling 能力，实现了本地私有知识库（RAG）与实时互联网数据的混合检索与精准路由。
 
-> **底层驱动：Google Gemini（推荐 `gemini-1.5-flash`）**，通过 `@langchain/google-genai` 原生接入。
+> **底层驱动：Google Gemini（推荐 `gemini-2.5-flash`）**，通过 `@langchain/google-genai` 原生接入。
 
 ## 🛠 技术栈与核心基建
 
