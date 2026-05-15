@@ -12,43 +12,89 @@
 
 一个基于现代化多智能体协作流（Agentic Workflow）的前端技术问答平台。系统摒弃了传统的线性问答，利用原生 Tool Calling 能力，实现了本地私有知识库（RAG）与实时互联网数据的混合检索与精准路由。
 
-> **底层驱动：Google Gemini（推荐 `gemini-2.5-flash`）**，通过 `@langchain/google-genai` 原生接入。
+> **底层驱动：Google Gemini（推荐 `gemini-2.5-flash`）**，通过 LangChain 接入。
+
+## 🏗 架构概览
+
+采用 **Next.js（前端 + BFF）+ FastAPI（AI 核心后端）** 混合架构：
+
+```
+浏览器 (page.tsx)
+    │  POST /api/chat  (SSE)
+    ▼
+Next.js BFF  app/api/chat/route.ts   ← 仅做代理，透传流式响应
+    │  POST http://127.0.0.1:8000/chat
+    ▼
+FastAPI      backend/main.py
+    │  agent.py：Gemini + Pinecone + Tavily + 结构化输出
+    ▼
+SSE 事件流 → 前端打字机效果（analysis / knowledgePoints / codeExample）
+```
+
+| 层级 | 职责 |
+|------|------|
+| **Next.js** | UI、SSE 消费与结构化卡片渲染；`/api/chat` 转发至 Python |
+| **FastAPI** | Agent 路由、工具调用、Pinecone 检索、JSON 收敛与降级兜底 |
+| **scripts/ingest.ts** | 仍由 Node 执行，向 Pinecone 写入向量（与后端共用同一索引） |
 
 ## 🛠 技术栈与核心基建
 
-- **前端框架**：Next.js 14（App Router） + React 18 + TypeScript + TailwindCSS
-- **AI 编排引擎**：LangChain.js
-  - 核心调度：`@langchain/core`（使用原生 `bindTools` 实现零冗余单步路由）
-  - 模型接入：`@langchain/google-genai`
-  - 向量切分：`@langchain/textsplitters`
+- **前端 / BFF**：Next.js 14（App Router） + React 18 + TypeScript + TailwindCSS
+- **AI 核心后端**：Python 3.11+ · FastAPI · Uvicorn
+- **AI 编排引擎**：
+  - **Node**（入库）：`@langchain/core`、`@langchain/textsplitters` + 自研 `GeminiEmbeddings`（768 维）
+  - **Python**（对话）：`langchain-google-genai`、`langchain-pinecone`、`langchain-community`（Tavily）
 - **基础设施**：
-  - **Pinecone**：Serverless 向量数据库（用于存储与检索前端底层原理）
-  - **Tavily**：实时互联网搜索引擎（用于获取 2026 年最新前沿技术与实时物理数据）
+  - **Pinecone**：Serverless 向量数据库（本地手册 RAG）
+  - **Tavily**：实时互联网搜索（可选，配置 `TAVILY_API_KEY` 后启用）
 
 ## 📂 目录结构
 
 ```text
 app/
-  api/chat/route.ts        # Agent 核心大脑：意图拦截 + 原生 Tool Calling + 降级兜底
-  layout.tsx               # 根布局
-  page.tsx                 # 聊天 UI（流式无缝渲染、结构化卡片展示）
+  api/chat/route.ts        # BFF：转发请求至 FastAPI，透传 SSE
+  layout.tsx
+  page.tsx                 # 聊天 UI（SSE 打字机 + 结构化卡片）
+backend/
+  main.py                  # FastAPI 入口，POST /chat → StreamingResponse
+  agent.py                 # Agent 大脑：Tool Calling + 结构化输出 + SSE
+  config.py                # 环境变量（兼容根目录 .env.local）
+  requirements.txt
+  .env.example
 docs/
   frontend-handbook.md     # RAG 私有知识库源文件
+lib/
+  embeddings.ts            # 入库脚本使用的 Gemini 768 维 Embedding
 scripts/
-  ingest.ts                # 自动化数据向量化与 Pinecone 写入脚本
+  ingest.ts                # 向量化并写入 Pinecone
 ```
 
 ## 快速开始
 
 ### 1. 安装依赖
 
+**前端：**
+
 ```bash
 npm install
 ```
 
+**Python 后端：**
+
+```bash
+cd backend
+python -m venv venv
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+# source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
 ### 2. 配置环境变量
 
-复制 `.env.local.example` 为 `.env.local` 并填写：
+复制 `.env.local.example` 为 `.env.local` 并填写（**Next 与 Python 共用同一文件**，`backend/config.py` 会自动加载）：
 
 ```env
 # 必填
@@ -57,20 +103,25 @@ GEMINI_API_KEY=AIxxxxxxxxxxxxxxxxxxxx
 # 可选，默认 gemini-2.5-flash
 # GEMINI_MODEL=gemini-2.5-flash
 
-# 国内访问 Google API 必填
+# 国内访问 Google API 建议配置
 HTTPS_PROXY=http://127.0.0.1:7890
 
 # Pinecone（RAG 必填）
 PINECONE_API_KEY=pcsk_xxxxxxxx
 PINECONE_INDEX=ai-interviewer
 
-# Tavily（互联网搜索，可选；留空则 Agent 只用本地手册一个工具）
+# Tavily（互联网搜索，可选；留空则 Agent 只用本地手册）
 # TAVILY_API_KEY=tvly-xxxxxxxx
+
+# 可选：FastAPI 地址（Next BFF 代理目标，默认 http://127.0.0.1:8000）
+# CHAT_BACKEND_URL=http://127.0.0.1:8000
 ```
 
-> - Gemini Key：[Google AI Studio](https://aistudio.google.com/app/apikey) 免费申请。
-> - Pinecone：[app.pinecone.io](https://app.pinecone.io) 注册 → 创建 Serverless 索引，**维度 768、metric cosine**（与 `gemini-embedding-001` 截断到 768 维后对齐）。
-> - Tavily：[app.tavily.com](https://app.tavily.com) 免费层每月 1000 次搜索。
+也可在 `backend/` 下复制 `.env.example` 为 `backend/.env`；根目录 `.env.local` 会与之合并加载。
+
+> - Gemini Key：[Google AI Studio](https://aistudio.google.com/app/apikey)
+> - Pinecone：[app.pinecone.io](https://app.pinecone.io) → 索引 **维度 768、metric cosine**（与 `gemini-embedding-001` 对齐）
+> - Tavily：[app.tavily.com](https://app.tavily.com) 免费层每月 1000 次搜索
 
 ### 3. 向量入库（首次必须执行一次）
 
@@ -78,9 +129,22 @@ PINECONE_INDEX=ai-interviewer
 npm run ingest
 ```
 
-该脚本会读取 `docs/frontend-handbook.md`，按 500 字符 / 50 重叠切分，用 `text-embedding-004` 生成向量，覆盖写入 `PINECONE_INDEX` 索引。修改手册后重跑即可同步。
+该脚本读取 `docs/frontend-handbook.md`，按 500 字符 / 50 重叠切分，用 `gemini-embedding-001`（768 维）写入 `PINECONE_INDEX`。修改手册后重跑即可同步。
 
-### 4. 启动开发服务器
+### 4. 启动服务（需同时运行两个进程）
+
+**终端 1 — Python AI 后端：**
+
+```bash
+cd backend
+# 若已创建 venv，先 activate
+python main.py
+# 或：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+健康检查：[http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
+
+**终端 2 — Next.js 前端：**
 
 ```bash
 npm run dev
@@ -95,7 +159,7 @@ npm run dev
 ```
 [用户提问]
    │
-   ├─► 物理层正则拦截 (如"你好") ──(短路返回)──► [响应 JSON] ⚡ 极速 0 成本
+   ├─► 物理层正则拦截 (如"你好") ──(短路返回)──► [SSE 流式 JSON] ⚡ 极速 0 成本
    │
    ▼
 ┌────────────────────────────────────────────────────────┐
@@ -103,13 +167,13 @@ npm run dev
 │ (注入系统绝对时间戳，消除大模型"时间盲视"预测幻觉)     │
 │ ───────────────────────────────────────────────────────│
 │ 动态绑定 ▼                                             │
-│ ┌──────────────────┐   ┌──────────────────┐            │
-│ │search_frontend_  │   │internet_search   │            │
-│ │handbook(Pinecone)│   │(Tavily 泛搜索)   │            │
-│ └────────┬─────────┘   └────────┬─────────┘            │
+│ ┌──────────────────┐   ┌──────────────────┐          │
+│ │search_frontend_  │   │internet_search   │          │
+│ │handbook(Pinecone)│   │(Tavily 泛搜索)   │          │
+│ └────────┬─────────┘   └────────┬─────────┘          │
 │          └──────────────┬───────┘                      │
 │                         ▼                              │
-│       Node.js 后端手动执行工具，获取 Raw Text          │
+│       Python 后端手动执行工具，获取 Raw Text           │
 └─────────────────────────┬──────────────────────────────┘
                           │
                           ▼
@@ -122,41 +186,54 @@ npm run dev
 │ 🛡️ 容灾兜底 (Fallback)：                               │
 │ 若触发 429 额度限流或 API 宕机，拦截 500 报错，        │
 │ 强行组装降级 JSON，保障 C 端前端页面永不崩溃。         │
-└────────────────────────────────────────────────────────┘
+└─────────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+              SSE 增量推送 (text/event-stream)
+              delta → knowledgePoints → done
 ```
 
-1. **入库**（`npm run ingest`）：`frontend-handbook.md` → `RecursiveCharacterTextSplitter`（chunkSize 500 / overlap 50）→ `gemini-embedding-001` 截断到 768 维 → 覆盖写入 Pinecone。
-2. **Agent**（`app/api/chat/route.ts`）：基于 `createToolCallingAgent` + `AgentExecutor` 实现两个工具：
-   - `search_frontend_handbook` — 本地手册 Pinecone topK=3 检索
-   - `internet_search` — Tavily 互联网搜索（仅在 `TAVILY_API_KEY` 配置时启用）
-   - System Prompt 中详细告知工具用途与调用边界，由 Gemini 自主决定走哪一条
-3. **JSON 收敛**：Agent 输出的自由文本 + 原问题 → 再走一次 `gemini-2.5-flash.withStructuredOutput(schema)`，强制返回 `{ analysis, knowledgePoints, codeExample }` 三字段。
+1. **入库**（`npm run ingest`）：`frontend-handbook.md` → 切分 → `gemini-embedding-001`（768 维）→ 覆盖写入 Pinecone。
+2. **Agent**（`backend/agent.py`）：`ChatGoogleGenerativeAI` + `bind_tools`，两个工具：
+   - `search_frontend_handbook` — Pinecone topK=3
+   - `internet_search` — Tavily（仅配置 `TAVILY_API_KEY` 时启用）
+3. **JSON 收敛**：阶段 B `with_structured_output(InterviewResponse)`，字段 `{ analysis, knowledgePoints, codeExample }`。
+4. **流式输出**：完成后按字段切片经 SSE 推送到前端，实现打字机效果。
 
-> 此设计保证：**前端 `page.tsx` 对返回结构的解析不需要任何修改**。
+### SSE 事件格式（`backend/agent.py` → `app/page.tsx`）
+
+| 事件 `type` | 含义 |
+|-------------|------|
+| `delta` | `field: analysis \| codeExample`，`text` 为增量片段 |
+| `knowledgePoints` | `items: string[]`，一次性下发标签列表 |
+| `done` | 流结束 |
+| `error` | `message`，BFF 与前端展示错误 |
 
 ### 强制结构化输出（阶段 B）
 
-使用 LangChain 的 **`.withStructuredOutput(schema)`** 把 Gemini 的输出绑定到 JSON Schema 上：
+Pydantic / LangChain 将 Gemini 输出绑定到：
 
-```ts
+```json
 {
-  analysis: string;          // 技术分析
-  knowledgePoints: string[]; // 核心知识点
-  codeExample: string;       // 极简代码示例
+  "analysis": "技术分析（2~5 句）",
+  "knowledgePoints": ["知识点1", "知识点2"],
+  "codeExample": "// 极简代码或空字符串"
 }
 ```
 
-`withStructuredOutput` 底层调用 Gemini 的 **Function Calling / Response Schema** 能力，比单纯 Prompt 约束更稳定。同时服务端再做一次字段类型兜底校验，避免脏数据打挂前端。
+服务端再做字段类型兜底；限流时降级为纯文本 `analysis` + 占位标签。
 
 ### UI 卡片渲染
 
-前端 `app/page.tsx` 不会展示原始 JSON，而是将三个字段以「技术分析 / 核心知识点（Tag）/ 代码示例（代码块）」卡片化渲染。
+`app/page.tsx` 消费 SSE，将三个字段以「技术分析 / 核心知识点（Tag）/ 代码示例（代码块）」卡片化渲染，流式过程中逐字更新 `analysis` 与 `codeExample`。
 
 ## 切换模型
 
-只想换 Gemini 系列模型（如 `gemini-2.5-pro`、`gemini-2.0-flash`），改环境变量 `GEMINI_MODEL` 即可，**不需要改任何代码**。
+修改环境变量 `GEMINI_MODEL`（如 `gemini-2.5-pro`），重启 **Python 后端** 即可，无需改代码。
 
 ## 常见问题
 
-- **报错 `服务器未配置 GEMINI_API_KEY`**：在项目根目录创建 `.env.local` 并填入 Key，然后重启 `npm run dev`。
-- **网络不通**：Gemini API 域名为 `generativelanguage.googleapis.com`，部分网络环境需要代理。
+- **报错 `服务器未配置 GEMINI_API_KEY`**：在根目录 `.env.local` 填入 Key，重启 `npm run dev` 与 Python 后端。
+- **报错 `无法连接 AI 后端`**：确认 `backend` 已启动且监听 `8000`；或检查 `CHAT_BACKEND_URL`。
+- **网络不通**：Gemini 域名为 `generativelanguage.googleapis.com`；Node 与 Python 均可通过 `HTTPS_PROXY` 走代理（Python 侧 `httpx` 会读取该变量）。
+- **Pinecone 无结果**：先执行 `npm run ingest`，并确认索引维度为 **768**。
