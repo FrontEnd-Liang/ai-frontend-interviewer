@@ -1,7 +1,18 @@
+# Python 运行缓存与虚拟环境
+backend/__pycache__/
+*.py[cod]
+backend/venv/
+
 node_modules
 .next
 out
 .env
+.env.*
+!.env.example
+!.env.local.example
 .env.local
 .DS_Store
 *.log
+
+# 前端构建缓存
+*.tsbuildinfo

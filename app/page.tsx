@@ -8,6 +8,13 @@ interface InterviewAnswer {
   codeExample: string;
 }
 
+/** 与 backend/agent.py SSE 事件对齐 */
+type SsePayload =
+  | { type: "delta"; field: "analysis" | "codeExample"; text: string }
+  | { type: "knowledgePoints"; items: string[] }
+  | { type: "done" }
+  | { type: "error"; message?: string };
+
 type Message =
   | { id: string; role: "user"; content: string }
   | { id: string; role: "ai"; content: InterviewAnswer }
@@ -39,6 +46,8 @@ export default function HomePage() {
     setInput("");
     setLoading(true);
 
+    let streamingAiId: string | null = null;
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -46,25 +55,114 @@ export default function HomePage() {
         body: JSON.stringify({ message: trimmed }),
       });
 
-      const data = await res.json();
-
       if (!res.ok) {
-        throw new Error(data?.error || `请求失败 (${res.status})`);
+        const errBody = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        throw new Error(errBody?.error || `请求失败 (${res.status})`);
       }
 
-      const aiMsg: Message = {
-        id: uid(),
-        role: "ai",
-        content: data as InterviewAnswer,
-      };
-      setMessages((prev) => [...prev, aiMsg]);
+      const ct = res.headers.get("content-type") || "";
+
+      if (ct.includes("text/event-stream") && res.body) {
+        const aiId = uid();
+        streamingAiId = aiId;
+        const empty: InterviewAnswer = {
+          analysis: "",
+          knowledgePoints: [],
+          codeExample: "",
+        };
+        setMessages((prev) => [
+          ...prev,
+          { id: aiId, role: "ai", content: { ...empty } },
+        ]);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let carry = "";
+        let acc: InterviewAnswer = { ...empty };
+
+        const applyPayload = (p: SsePayload) => {
+          if (p.type === "error") {
+            throw new Error(p.message || "流式响应错误");
+          }
+          if (p.type === "delta" && p.field && p.text) {
+            if (p.field === "analysis") {
+              acc = { ...acc, analysis: acc.analysis + p.text };
+            } else if (p.field === "codeExample") {
+              acc = { ...acc, codeExample: acc.codeExample + p.text };
+            }
+          }
+          if (p.type === "knowledgePoints" && Array.isArray(p.items)) {
+            acc = {
+              ...acc,
+              knowledgePoints: p.items.filter(
+                (x): x is string => typeof x === "string"
+              ),
+            };
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          carry += decoder.decode(value, { stream: true });
+          const blocks = carry.split("\n\n");
+          carry = blocks.pop() ?? "";
+          for (const raw of blocks) {
+            const line = raw
+              .split("\n")
+              .map((l) => l.trim())
+              .find((l) => l.startsWith("data:"));
+            if (!line) continue;
+            const jsonStr = line.replace(/^data:\s*/i, "").trim();
+            if (!jsonStr) continue;
+            let payload: SsePayload;
+            try {
+              payload = JSON.parse(jsonStr) as SsePayload;
+            } catch {
+              continue;
+            }
+            applyPayload(payload);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiId && m.role === "ai"
+                  ? { ...m, content: { ...acc } }
+                  : m
+              )
+            );
+          }
+        }
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === aiId && m.role === "ai" ? { ...m, content: { ...acc } } : m
+          )
+        );
+      } else {
+        const data = (await res.json()) as InterviewAnswer & { error?: string };
+        if ("error" in data && data.error) {
+          throw new Error(String(data.error));
+        }
+        const aiMsg: Message = {
+          id: uid(),
+          role: "ai",
+          content: data as InterviewAnswer,
+        };
+        setMessages((prev) => [...prev, aiMsg]);
+      }
     } catch (err) {
       const errorMsg: Message = {
         id: uid(),
         role: "error",
         content: err instanceof Error ? err.message : "未知错误",
       };
-      setMessages((prev) => [...prev, errorMsg]);
+      setMessages((prev) => {
+        const base = streamingAiId
+          ? prev.filter((m) => m.id !== streamingAiId)
+          : prev;
+        return [...base, errorMsg];
+      });
     } finally {
       setLoading(false);
     }
