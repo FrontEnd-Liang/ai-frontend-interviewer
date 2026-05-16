@@ -32,9 +32,19 @@ class Settings(BaseSettings):
     # Optional: comma-separated origins for CORS (default allows local Next.js)
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # Supabase (optional — conversation memory)
+    supabase_url: str = ""
+    supabase_key: str = ""
+    # Max messages loaded into LLM context (~15 rounds = 30 messages)
+    memory_max_messages: int = 30
+
     @property
     def has_tavily(self) -> bool:
         return bool(self.tavily_api_key and self.tavily_api_key.strip())
+
+    @property
+    def has_supabase(self) -> bool:
+        return bool(self.supabase_url.strip() and self.supabase_key.strip())
 
 
 def get_settings() -> Settings:

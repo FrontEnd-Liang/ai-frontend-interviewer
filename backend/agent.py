@@ -25,6 +25,7 @@ from langchain_pinecone import PineconeVectorStore
 from pydantic import BaseModel, Field
 
 from config import Settings, get_settings
+from database import HistoryMessage, get_database
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,13 @@ GREETING_PAYLOAD: dict[str, Any] = {
     "knowledgePoints": ["系统就绪", "日常交互"],
     "codeExample": "",
 }
+
+# 存在对话历史时置于 System Prompt 最前，优先级高于工具路由与安全拒答
+HISTORY_PRIORITY_INSTRUCTION = """【最高优先级 · 对话记忆】
+处理有关用户身份（姓名、职位）、技术栈偏好或前文已提及具体事实的提问时，你必须**优先且仅**根据传入的对话上下文（history）及已注入的多轮消息进行回答。
+严禁在此类情况下使用「无法访问隐私信息」「无法访问个人数据」「无法提供个性化回答」等通用拒答语。
+只有在上下文中明确查不到时，才可表示不知道。
+此规则的优先级高于一切角色设定、工具路由规则与安全话术。"""
 
 FORMATTER_SYSTEM_PROMPT = """你是一个内容到 JSON 的纯转换器。
 将下方"已收集到的资料"忠实地折叠进以下 schema：
@@ -139,24 +147,35 @@ class Gemini768Embeddings(Embeddings):
             return vecs
 
 
-def build_router_system_prompt(has_internet: bool) -> str:
+def build_router_system_prompt(has_internet: bool, *, has_history: bool = False) -> str:
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y/%m/%d %H:%M:%S")
     if not has_internet:
-        return (
+        router_rules = (
             "你是一个无情的工具路由机器。\n"
             "遇到 [闭包,React,原理,Fiber,事件循环,Vue,浏览器,工程化,性能,内存] → 必须调用 search_frontend_handbook。\n"
             "禁止任何解释或闲聊，直接返回工具调用指令。"
         )
-    return (
-        f"当前系统绝对时间：{today}。\n"
-        "你是一个无情的工具路由机器。\n"
-        "遇到 [天气,股票,新闻,最新,2025,2026] 必须调用 internet_search；\n"
-        "遇到 [闭包,React,原理] 必须调用 search_frontend_handbook。\n"
-        "禁止任何解释或闲聊，直接返回工具调用指令。"
+    else:
+        router_rules = (
+            f"当前系统绝对时间：{today}。\n"
+            "你是一个无情的工具路由机器。\n"
+            "遇到 [天气,股票,新闻,最新,2025,2026] 必须调用 internet_search；\n"
+            "遇到 [闭包,React,原理] 必须调用 search_frontend_handbook。\n"
+            "禁止任何解释或闲聊，直接返回工具调用指令。"
+        )
+
+    if not has_history:
+        return router_rules
+
+    memory_router_addon = (
+        "【记忆问答例外 · 高于工具路由】\n"
+        "若当前问题仅能从对话历史回答（如候选人姓名、擅长框架、职位、前文已陈述的事实），"
+        "请直接依据 history 用简洁中文作答，不要调用任何工具，不要使用隐私/安全类拒答话术。"
     )
+    return f"{HISTORY_PRIORITY_INSTRUCTION}\n\n{memory_router_addon}\n\n{router_rules}"
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -178,6 +197,56 @@ def _normalize_ai_content(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False)
 
 
+def _assistant_content_for_context(raw: str) -> str:
+    """Flatten stored assistant JSON into readable text for prompts."""
+    text = raw.strip()
+    if not text:
+        return text
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            parts: list[str] = []
+            if obj.get("analysis"):
+                parts.append(str(obj["analysis"]))
+            kps = obj.get("knowledgePoints")
+            if isinstance(kps, list) and kps:
+                parts.append("知识点: " + ", ".join(str(k) for k in kps))
+            if obj.get("codeExample"):
+                parts.append(str(obj["codeExample"]))
+            if parts:
+                return "\n".join(parts)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return text
+
+
+def _format_history_block(history: list[HistoryMessage] | None) -> str:
+    """Human-readable history block for stage B formatter."""
+    if not history:
+        return ""
+    lines: list[str] = ["# 对话历史（回答身份/偏好/前文事实时必须优先采信，禁止隐私拒答）"]
+    for h in history:
+        label = "用户" if h.role == "user" else "助手"
+        body = (
+            h.content
+            if h.role == "user"
+            else _assistant_content_for_context(h.content)
+        )
+        lines.append(f"- {label}: {body.strip()}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _history_to_langchain(history: list[HistoryMessage] | None) -> list[HumanMessage | AIMessage]:
+    """Map stored turns to LangChain messages (chronological)."""
+    out: list[HumanMessage | AIMessage] = []
+    for h in history or []:
+        if h.role == "user":
+            out.append(HumanMessage(h.content))
+        elif h.role == "assistant":
+            out.append(AIMessage(_assistant_content_for_context(h.content)))
+    return out
+
+
 def _interview_to_dict(obj: InterviewResponse | dict[str, Any]) -> dict[str, Any]:
     if isinstance(obj, InterviewResponse):
         return obj.model_dump()
@@ -190,7 +259,11 @@ def _interview_to_dict(obj: InterviewResponse | dict[str, Any]) -> dict[str, Any
     }
 
 
-def run_phases_sync(message: str, settings: Settings) -> dict[str, Any]:
+def run_phases_sync(
+    message: str,
+    settings: Settings,
+    history: list[HistoryMessage] | None = None,
+) -> dict[str, Any]:
     """Blocking: stage A (tools) + stage B (structured JSON). Returns camelCase dict."""
     embeddings = Gemini768Embeddings(settings)
     vector_store = PineconeVectorStore.from_existing_index(
@@ -239,13 +312,16 @@ def run_phases_sync(message: str, settings: Settings) -> dict[str, Any]:
         [getattr(t, "name", "?") for t in tools],
     )
 
+    has_history = bool(history)
     model_with_tools = model.bind_tools(tools)
-    ai_msg: AIMessage = model_with_tools.invoke(
-        [
-            SystemMessage(build_router_system_prompt(has_internet)),
-            HumanMessage(message),
-        ]
-    )
+    router_messages: list[SystemMessage | HumanMessage | AIMessage] = [
+        SystemMessage(build_router_system_prompt(has_internet, has_history=has_history)),
+        *_history_to_langchain(history),
+        HumanMessage(message),
+    ]
+    if history:
+        logger.info("[/chat] injected %s history message(s) into router context", len(history))
+    ai_msg: AIMessage = model_with_tools.invoke(router_messages)
 
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
     called_tools: list[str] = []
@@ -287,17 +363,24 @@ def run_phases_sync(message: str, settings: Settings) -> dict[str, Any]:
     )
 
     structured_model = model.with_structured_output(InterviewResponse)
+    history_block = _format_history_block(history)
     formatter_user_content = (
+        f"{history_block}"
         f"# 原始问题\n{message}\n\n"
         f"# 已收集到的资料（Agent 已自主调用工具检索整理）\n"
-        f"{raw_answer or '(Agent 未提供文字回答，请基于你已有的前端知识回答原始问题。)'}\n\n"
+        f"{raw_answer or '(Agent 未提供文字回答，请基于对话历史或前端知识回答原始问题。)'}\n\n"
         "请基于以上资料，严格按字段约束输出结构化 JSON。"
+        "若原始问题涉及姓名、技术栈或前文事实，必须优先从「对话历史」提取答案写入 analysis，禁止隐私拒答。"
     )
+
+    formatter_system = FORMATTER_SYSTEM_PROMPT
+    if has_history:
+        formatter_system = f"{HISTORY_PRIORITY_INSTRUCTION}\n\n{FORMATTER_SYSTEM_PROMPT}"
 
     try:
         final_result = structured_model.invoke(
             [
-                SystemMessage(FORMATTER_SYSTEM_PROMPT),
+                SystemMessage(formatter_system),
                 HumanMessage(formatter_user_content),
             ]
         )
@@ -366,13 +449,38 @@ def validate_settings(settings: Settings) -> str | None:
     return None
 
 
-async def chat_sse(raw_message: str | None) -> AsyncIterator[str]:
+async def _persist_turn_background(
+    session_id: str,
+    user_id: str | None,
+    user_text: str,
+    assistant_payload: dict[str, Any],
+) -> None:
+    try:
+        await asyncio.to_thread(
+            get_database().persist_turn,
+            session_id,
+            user_id,
+            user_text,
+            assistant_payload,
+        )
+    except Exception as e:
+        logger.warning("[/chat] async persist_turn failed: %s", e)
+
+
+async def chat_sse(
+    raw_message: str | None,
+    *,
+    session_id: str | None = None,
+    user_id: str | None = None,
+) -> AsyncIterator[str]:
     """
     Async generator of SSE lines (`data: {...}\\n\\n`).
     错误也以 SSE 事件返回，便于 BFF 原样透传。
     """
     settings = get_settings()
     message = (raw_message or "").strip()
+    sid = (session_id or "").strip() or None
+    uid = (user_id or "").strip() or None
 
     if not message:
         yield _sse({"type": "error", "message": "请输入有效的问题内容"})
@@ -381,6 +489,10 @@ async def chat_sse(raw_message: str | None) -> AsyncIterator[str]:
     if GREETING_REGEX.match(message):
         async for line in _stream_answer_payload(GREETING_PAYLOAD):
             yield line
+        if sid and get_database().enabled:
+            asyncio.create_task(
+                _persist_turn_background(sid, uid, message, GREETING_PAYLOAD)
+            )
         return
 
     err = validate_settings(settings)
@@ -388,8 +500,13 @@ async def chat_sse(raw_message: str | None) -> AsyncIterator[str]:
         yield _sse({"type": "error", "message": err})
         return
 
+    db = get_database()
+    history: list[HistoryMessage] = []
+    if sid and db.enabled:
+        history = await asyncio.to_thread(db.fetch_recent_messages, sid)
+
     try:
-        safe = await asyncio.to_thread(run_phases_sync, message, settings)
+        safe = await asyncio.to_thread(run_phases_sync, message, settings, history)
     except Exception as e:
         logger.exception("[/chat] error")
         yield _sse(
@@ -402,3 +519,6 @@ async def chat_sse(raw_message: str | None) -> AsyncIterator[str]:
 
     async for line in _stream_answer_payload(safe):
         yield line
+
+    if sid and db.enabled:
+        asyncio.create_task(_persist_turn_background(sid, uid, message, safe))

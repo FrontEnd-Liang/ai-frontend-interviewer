@@ -24,7 +24,177 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+const SESSION_STORAGE_KEY = "interview_session_id";
+/** 整次 /chat 请求（含 SSE 流）最长等待时间 */
+const CHAT_TIMEOUT_MS = 30_000;
+
+const EMPTY_ANSWER: InterviewAnswer = {
+  analysis: "",
+  knowledgePoints: [],
+  codeExample: "",
+};
+
+function getOrCreateSessionId(): string {
+  if (typeof window === "undefined") return "";
+  let id = localStorage.getItem(SESSION_STORAGE_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(SESSION_STORAGE_KEY, id);
+  }
+  return id;
+}
+
+function parseSseDataLine(rawBlock: string): SsePayload | null {
+  const line = rawBlock
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.startsWith("data:"));
+  if (!line) return null;
+  const jsonStr = line.replace(/^data:\s*/i, "").trim();
+  if (!jsonStr) return null;
+  try {
+    const parsed = JSON.parse(jsonStr) as SsePayload;
+    if (parsed && typeof parsed === "object" && "type" in parsed) {
+      return parsed;
+    }
+  } catch {
+    /* 非预期数据包：跳过本条，不中断整流 */
+  }
+  return null;
+}
+
+type SseConsumeResult = {
+  answer: InterviewAnswer;
+  sawDone: boolean;
+};
+
+/**
+ * 消费 SSE 响应体；无论成功/失败/中断，调用方须在 finally 中 setLoading(false)。
+ * 等价于对 EventSource 的 onmessage + onerror + onclose 做统一收尾。
+ */
+async function consumeChatSseStream(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  onPartial: (answer: InterviewAnswer) => void
+): Promise<SseConsumeResult> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let carry = "";
+  let acc: InterviewAnswer = { ...EMPTY_ANSWER };
+  let sawDone = false;
+
+  const onAbort = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", onAbort);
+
+  try {
+    while (!signal.aborted) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (readErr) {
+        if (signal.aborted) {
+          throw new DOMException("请求已取消或超时", "AbortError");
+        }
+        throw readErr;
+      }
+
+      const { done, value } = chunk;
+      if (done) break;
+
+      carry += decoder.decode(value, { stream: true });
+      const blocks = carry.split("\n\n");
+      carry = blocks.pop() ?? "";
+
+      for (const raw of blocks) {
+        const payload = parseSseDataLine(raw);
+        if (!payload) continue;
+
+        if (payload.type === "error") {
+          throw new Error(payload.message || "流式响应错误");
+        }
+        if (payload.type === "done") {
+          sawDone = true;
+          continue;
+        }
+        if (payload.type === "delta" && payload.field && payload.text) {
+          if (payload.field === "analysis") {
+            acc = { ...acc, analysis: acc.analysis + payload.text };
+          } else if (payload.field === "codeExample") {
+            acc = { ...acc, codeExample: acc.codeExample + payload.text };
+          }
+        }
+        if (payload.type === "knowledgePoints" && Array.isArray(payload.items)) {
+          acc = {
+            ...acc,
+            knowledgePoints: payload.items.filter(
+              (x): x is string => typeof x === "string"
+            ),
+          };
+        }
+        onPartial({ ...acc });
+      }
+    }
+
+    if (signal.aborted) {
+      throw new DOMException("请求已取消或超时", "AbortError");
+    }
+
+    if (carry.trim()) {
+      const tail = parseSseDataLine(carry);
+      if (tail) {
+        if (tail.type === "error") {
+          throw new Error(tail.message || "流式响应错误");
+        }
+        if (tail.type === "done") sawDone = true;
+        if (tail.type === "delta" && tail.field && tail.text) {
+          if (tail.field === "analysis") {
+            acc = { ...acc, analysis: acc.analysis + tail.text };
+          } else if (tail.field === "codeExample") {
+            acc = { ...acc, codeExample: acc.codeExample + tail.text };
+          }
+        }
+        if (tail.type === "knowledgePoints" && Array.isArray(tail.items)) {
+          acc = {
+            ...acc,
+            knowledgePoints: tail.items.filter(
+              (x): x is string => typeof x === "string"
+            ),
+          };
+        }
+        onPartial({ ...acc });
+      }
+    }
+
+    return { answer: acc, sawDone };
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    try {
+      reader.releaseLock();
+    } catch {
+      /* 已释放或已取消 */
+    }
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    err instanceof DOMException && err.name === "AbortError"
+  );
+}
+
+function toUserFacingError(err: unknown): string {
+  if (isAbortError(err)) {
+    return `请求超时（${CHAT_TIMEOUT_MS / 1000} 秒），请稍后重试`;
+  }
+  if (err instanceof Error) return err.message;
+  return "未知错误";
+}
+
 export default function HomePage() {
+  const [sessionId] = useState(getOrCreateSessionId);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -47,12 +217,28 @@ export default function HomePage() {
     setLoading(true);
 
     let streamingAiId: string | null = null;
+    const abortController = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      abortController.abort();
+    }, CHAT_TIMEOUT_MS);
+
+    const finishLoading = () => {
+      window.clearTimeout(timeoutId);
+      setLoading(false);
+    };
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: trimmed }),
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          message: trimmed,
+          session_id: sessionId || undefined,
+        }),
+        signal: abortController.signal,
       });
 
       if (!res.ok) {
@@ -67,78 +253,40 @@ export default function HomePage() {
       if (ct.includes("text/event-stream") && res.body) {
         const aiId = uid();
         streamingAiId = aiId;
-        const empty: InterviewAnswer = {
-          analysis: "",
-          knowledgePoints: [],
-          codeExample: "",
-        };
         setMessages((prev) => [
           ...prev,
-          { id: aiId, role: "ai", content: { ...empty } },
+          { id: aiId, role: "ai", content: { ...EMPTY_ANSWER } },
         ]);
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let carry = "";
-        let acc: InterviewAnswer = { ...empty };
-
-        const applyPayload = (p: SsePayload) => {
-          if (p.type === "error") {
-            throw new Error(p.message || "流式响应错误");
-          }
-          if (p.type === "delta" && p.field && p.text) {
-            if (p.field === "analysis") {
-              acc = { ...acc, analysis: acc.analysis + p.text };
-            } else if (p.field === "codeExample") {
-              acc = { ...acc, codeExample: acc.codeExample + p.text };
-            }
-          }
-          if (p.type === "knowledgePoints" && Array.isArray(p.items)) {
-            acc = {
-              ...acc,
-              knowledgePoints: p.items.filter(
-                (x): x is string => typeof x === "string"
-              ),
-            };
-          }
+        const updateAiBubble = (answer: InterviewAnswer) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiId && m.role === "ai"
+                ? { ...m, content: { ...answer } }
+                : m
+            )
+          );
         };
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          carry += decoder.decode(value, { stream: true });
-          const blocks = carry.split("\n\n");
-          carry = blocks.pop() ?? "";
-          for (const raw of blocks) {
-            const line = raw
-              .split("\n")
-              .map((l) => l.trim())
-              .find((l) => l.startsWith("data:"));
-            if (!line) continue;
-            const jsonStr = line.replace(/^data:\s*/i, "").trim();
-            if (!jsonStr) continue;
-            let payload: SsePayload;
-            try {
-              payload = JSON.parse(jsonStr) as SsePayload;
-            } catch {
-              continue;
-            }
-            applyPayload(payload);
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === aiId && m.role === "ai"
-                  ? { ...m, content: { ...acc } }
-                  : m
-              )
-            );
-          }
+        /* onerror → 抛至外层 catch；onclose → consume 内部 reader 释放 */
+        const streamResult = await consumeChatSseStream(
+          res.body,
+          abortController.signal,
+          updateAiBubble
+        );
+
+        const { answer, sawDone } = streamResult;
+        updateAiBubble(answer);
+        const hasContent =
+          Boolean(answer.analysis?.trim()) ||
+          answer.knowledgePoints.length > 0 ||
+          Boolean(answer.codeExample?.trim());
+
+        if (!sawDone && !hasContent) {
+          throw new Error("响应未完成或数据异常，请重试");
         }
 
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === aiId && m.role === "ai" ? { ...m, content: { ...acc } } : m
-          )
-        );
+        updateAiBubble(answer);
       } else {
         const data = (await res.json()) as InterviewAnswer & { error?: string };
         if ("error" in data && data.error) {
@@ -155,7 +303,7 @@ export default function HomePage() {
       const errorMsg: Message = {
         id: uid(),
         role: "error",
-        content: err instanceof Error ? err.message : "未知错误",
+        content: toUserFacingError(err),
       };
       setMessages((prev) => {
         const base = streamingAiId
@@ -164,7 +312,7 @@ export default function HomePage() {
         return [...base, errorMsg];
       });
     } finally {
-      setLoading(false);
+      finishLoading();
     }
   }
 

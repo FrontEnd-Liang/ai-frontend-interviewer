@@ -40,9 +40,15 @@ async def chat(request: Request) -> StreamingResponse:
     except Exception:
         body = {}
     message = body.get("message")
+    session_id = body.get("session_id")
+    user_id = body.get("user_id")
 
     async def body_bytes() -> AsyncIterator[bytes]:
-        async for chunk in chat_sse(message):
+        async for chunk in chat_sse(
+            message,
+            session_id=session_id,
+            user_id=user_id,
+        ):
             yield chunk.encode("utf-8")
 
     return StreamingResponse(
