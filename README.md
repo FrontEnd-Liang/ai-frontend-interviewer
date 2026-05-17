@@ -3,8 +3,8 @@
 ## 📺 项目演示 (Demo)
 
 <div align="center">
-  <video src="https://github.com/FrontEnd-Liang/ai-frontend-interviewer/issues/2#issue-4462811577" width="100%" controls autoplay loop muted>
-    您的浏览器不支持 HTML5 视频，请点击<a href="https://github.com/FrontEnd-Liang/ai-frontend-interviewer/issues/2#issue-4462811577">此处</a>查看演示。
+  <video src="https://github.com/user-attachments/assets/bff85d13-fd38-46e7-abcf-92223a5d6498" width="100%" controls autoplay loop muted>
+    您的浏览器不支持 HTML5 视频，请点击<a href="https://github.com/user-attachments/assets/bff85d13-fd38-46e7-abcf-92223a5d6498">此处</a>查看演示。
   </video>
 </div>
 
