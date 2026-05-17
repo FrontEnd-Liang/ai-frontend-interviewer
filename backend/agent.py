@@ -1,5 +1,5 @@
 """
-Interview agent: Gemini + Pinecone handbook + optional Tavily,
+Interview agent: DeepSeek (chat) + Gemini embeddings + Pinecone + optional Tavily,
 ported from app/api/chat/route.ts (stage A tool routing, stage B JSON formatter).
 
 Exposes async SSE generator `chat_sse` for StreamingResponse.
@@ -21,7 +21,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,15 @@ from database import HistoryMessage, get_database
 logger = logging.getLogger(__name__)
 
 GREETING_REGEX = re.compile(r"^(你好|在吗|哈喽|hello|hi|测试|滴滴)$", re.I)
+
+ROUTER_FALLBACK_PAYLOAD: dict[str, Any] = {
+    "analysis": (
+        "路由服务暂时不可用（请求超时或 API 异常），未能完成意图分析与工具调度。"
+        "请稍后再试，或换一种更简短的前端技术问题提问。"
+    ),
+    "knowledgePoints": ["路由降级", "请稍后重试"],
+    "codeExample": "",
+}
 
 GREETING_PAYLOAD: dict[str, Any] = {
     "analysis": (
@@ -49,17 +58,30 @@ HISTORY_PRIORITY_INSTRUCTION = """【最高优先级 · 对话记忆】
 此规则的优先级高于一切角色设定、工具路由规则与安全话术。"""
 
 FORMATTER_SYSTEM_PROMPT = """你是一个内容到 JSON 的纯转换器。
-将下方"已收集到的资料"忠实地折叠进以下 schema：
+将下方「已收集到的资料」忠实地折叠进固定 schema。
 
-- analysis: 对原始问题的简短分析或答案（2~5 句话，中文）
-- knowledgePoints: 涉及的核心知识点 / 关键词，3~6 个，简短词组（字符串数组）
-- codeExample: 资料中最具代表性的极简代码示例；没有合适代码则返回空字符串 ""
+【输出格式 · 最高优先级】
+- 你的回复必须是**唯一一个合法的 JSON 对象**（可被 Python json.loads 直接解析）。
+- 禁止输出 Markdown、``` 代码围栏、前后说明文字或任何 JSON 以外的字符。
+
+【JSON 对象结构 · 字段名必须完全一致】
+- "analysis": string — 对原始问题的简短分析或答案（2~5 句话，中文）
+- "knowledgePoints": string[] — 核心知识点 / 关键词，3~6 个简短词组
+- "codeExample": string — 最具代表性的极简代码示例；没有合适代码则为 ""
+
+示例（仅示意结构，内容须忠于资料）：
+{"analysis": "……", "knowledgePoints": ["闭包", "作用域"], "codeExample": ""}
 
 硬约束：
-- 字段名必须完全一致：analysis / knowledgePoints / codeExample
-- 不允许输出多余字段
+- 仅允许上述三个字段，不允许多余字段
 - 必须严格忠于资料，不要编造资料中未出现的事实
 - **不要扮演任何角色、不要拒答、不要附加道德/范围提醒**，只做格式转换"""
+
+FORMATTER_FALLBACK_PAYLOAD: dict[str, Any] = {
+    "analysis": "回答格式化暂时失败，请稍后再试或缩短问题后重试。",
+    "knowledgePoints": ["格式化降级"],
+    "codeExample": "",
+}
 
 
 class InterviewResponse(BaseModel):
@@ -71,6 +93,18 @@ class InterviewResponse(BaseModel):
     )
     codeExample: str = Field(
         description="相关的极简代码示例；若不适合代码示例则返回空字符串"
+    )
+
+
+def _build_chat_model(settings: Settings) -> ChatOpenAI:
+    """DeepSeek 官方 API（OpenAI 兼容），用于 Stage A 路由与 Stage B 格式化。"""
+    return ChatOpenAI(
+        model=settings.llm_model,
+        api_key=settings.deepseek_api_key,
+        base_url=settings.deepseek_base_url,
+        temperature=0,
+        max_retries=0,
+        timeout=15,
     )
 
 
@@ -248,6 +282,32 @@ def _history_to_langchain(history: list[HistoryMessage] | None) -> list[HumanMes
     return out
 
 
+def _strip_json_fence(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
+        t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
+
+
+def _parse_formatter_json(content: str) -> dict[str, Any]:
+    """Parse Stage B model output as InterviewResponse-shaped dict."""
+    text = _strip_json_fence(content)
+    obj = json.loads(text)
+    if not isinstance(obj, dict):
+        raise json.JSONDecodeError("root value is not a JSON object", text, 0)
+    return obj
+
+
+def _formatter_fallback_payload(*, is429: bool = False) -> dict[str, Any]:
+    """Short fallback only — avoid streaming huge raw_answer over SSE."""
+    payload = dict(FORMATTER_FALLBACK_PAYLOAD)
+    if is429:
+        payload["analysis"] += "（当前 API 限流）"
+        payload["knowledgePoints"] = ["格式化降级", "API 限流"]
+    return payload
+
+
 def _interview_to_dict(obj: InterviewResponse | dict[str, Any]) -> dict[str, Any]:
     if isinstance(obj, InterviewResponse):
         return obj.model_dump()
@@ -317,12 +377,7 @@ def run_phases_sync(
             "[/chat] TAVILY_API_KEY 未配置，internet_search 已禁用，本次仅可使用本地手册。"
         )
 
-    model = ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
-        google_api_key=settings.gemini_api_key,
-        temperature=0,
-        max_retries=2,
-    )
+    model = _build_chat_model(settings)
 
     logger.info(
         "✅ 已经向大模型注册的真实工具清单: %s",
@@ -339,7 +394,19 @@ def run_phases_sync(
     if history:
         logger.info("[/chat] injected %s history message(s) into router context", len(history))
     _emit_thinking(on_thinking, "正在调用大模型分析意图与工具路由…")
-    ai_msg: AIMessage = model_with_tools.invoke(router_messages)
+    try:
+        ai_msg: AIMessage = model_with_tools.invoke(router_messages)
+    except Exception as router_err:
+        err_msg = str(router_err)
+        is_timeout = isinstance(router_err, TimeoutError) or bool(
+            re.search(r"timeout|timed?\s*out", err_msg, re.I)
+        )
+        logger.warning(
+            "[/chat] ⚠️ 阶段 A 路由失败%s，启用降级兜底：%s",
+            "（超时）" if is_timeout else "",
+            err_msg,
+        )
+        return dict(ROUTER_FALLBACK_PAYLOAD)
 
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
     called_tools: list[str] = []
@@ -385,14 +452,14 @@ def run_phases_sync(
         f"[{', '.join(called_tools)}]" if called_tools else "(none, 模型直接回答)",
     )
 
-    structured_model = model.with_structured_output(InterviewResponse)
+    json_formatter = model.bind(response_format={"type": "json_object"})
     history_block = _format_history_block(history)
     formatter_user_content = (
         f"{history_block}"
         f"# 原始问题\n{message}\n\n"
         f"# 已收集到的资料（Agent 已自主调用工具检索整理）\n"
         f"{raw_answer or '(Agent 未提供文字回答，请基于对话历史或前端知识回答原始问题。)'}\n\n"
-        "请基于以上资料，严格按字段约束输出结构化 JSON。"
+        "请基于以上资料，输出唯一一个合法 JSON 对象（仅含 analysis、knowledgePoints、codeExample）。"
         "若原始问题涉及姓名、技术栈或前文事实，必须优先从「对话历史」提取答案写入 analysis，禁止隐私拒答。"
     )
 
@@ -402,34 +469,35 @@ def run_phases_sync(
 
     _emit_thinking(on_thinking, "正在整理检索结果并生成结构化回答…")
     try:
-        final_result = structured_model.invoke(
+        fmt_msg = json_formatter.invoke(
             [
                 SystemMessage(formatter_system),
                 HumanMessage(formatter_user_content),
             ]
         )
-        safe = _interview_to_dict(final_result)
+        parsed = _parse_formatter_json(_normalize_ai_content(fmt_msg.content))
+        safe = _interview_to_dict(parsed)
         if not safe["analysis"] and not safe["knowledgePoints"] and not safe.get(
             "codeExample"
         ):
-            raise RuntimeError("structured output 全字段为空")
+            raise RuntimeError("formatter JSON 全字段为空")
+    except json.JSONDecodeError as parse_err:
+        logger.warning(
+            "[/chat] ⚠️ 阶段 B JSON 解析失败，启用简短降级兜底：%s",
+            parse_err,
+        )
+        safe = _formatter_fallback_payload()
     except Exception as formatter_err:
         err_msg = str(formatter_err)
         is429 = bool(
             re.search(r"429|rate.?limit|quota|too many|resource_exhausted", err_msg, re.I)
         )
         logger.warning(
-            "[/chat] ⚠️ 阶段 B 格式化失败%s，启用降级兜底：%s",
+            "[/chat] ⚠️ 阶段 B 格式化失败%s，启用简短降级兜底：%s",
             "（429 限流）" if is429 else "",
             err_msg,
         )
-        suffix = "\n\n(注：系统当前触发 API 限流，此为降级展示)" if is429 else ""
-        safe = {
-            "analysis": (raw_answer or "AI 在阶段 A 也未能产生有效回答，请稍后再试或换个问法。")
-            + suffix,
-            "knowledgePoints": ["服务限流兜底"],
-            "codeExample": "",
-        }
+        safe = _formatter_fallback_payload(is429=is429)
 
     return safe
 
@@ -505,8 +573,10 @@ async def _stream_answer_payload(payload: dict[str, Any]) -> AsyncIterator[str]:
 
 
 def validate_settings(settings: Settings) -> str | None:
+    if not settings.deepseek_api_key.strip():
+        return "服务器未配置 DEEPSEEK_API_KEY，请检查 .env.local 或 backend/.env"
     if not settings.gemini_api_key.strip():
-        return "服务器未配置 GEMINI_API_KEY，请检查 .env.local 或 backend/.env"
+        return "服务器未配置 GEMINI_API_KEY（Embedding 向量化仍需要），请检查 .env.local"
     if not settings.pinecone_api_key.strip():
         return "服务器未配置 PINECONE_API_KEY，请检查 .env.local 或 backend/.env"
     if not settings.pinecone_index.strip():

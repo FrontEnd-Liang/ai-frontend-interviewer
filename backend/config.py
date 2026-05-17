@@ -21,13 +21,19 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Chat 路由 / 格式化（DeepSeek 官方 API）
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    llm_model: str = "deepseek-chat"
+
+    # Embedding（Pinecone RAG，仍使用 Gemini）
     gemini_api_key: str = ""
+    gemini_embedding_model: str = "gemini-embedding-001"
+    embedding_dimensions: int = 768
+
     pinecone_api_key: str = ""
     pinecone_index: str = ""
     tavily_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_embedding_model: str = "gemini-embedding-001"
-    embedding_dimensions: int = 768
 
     # Optional: comma-separated origins for CORS (default allows local Next.js)
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
