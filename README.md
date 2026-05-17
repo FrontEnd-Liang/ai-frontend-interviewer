@@ -10,7 +10,7 @@
 
 > **注：** 右侧终端实时展示了 Agent 的路由决策逻辑（如 `internet_search` 调用及物理层拦截日志）。
 
-一个基于现代化多智能体协作流（Agentic Workflow）的前端技术问答平台。系统摒弃了传统的线性问答，利用原生 Tool Calling 能力，实现了本地私有知识库（RAG）、实时互联网检索、**多轮对话记忆（Supabase）** 与 SSE 流式结构化回答。
+一个基于现代化多智能体协作流（Agentic Workflow）的前端技术问答平台。系统摒弃了传统的线性问答，利用原生 Tool Calling 能力，实现了本地私有知识库（RAG）、实时互联网检索、**多轮对话记忆（Supabase）**、**思考链状态可视化（Thinking SSE）** 与流式打字机结构化回答。
 
 > **底层驱动：Google Gemini（推荐 `gemini-2.5-flash`）**，通过 LangChain 接入。
 
@@ -29,19 +29,19 @@ FastAPI      backend/main.py
     ├─ database.py   ← 读取/写入 Supabase 对话历史（最近 ~15 轮）
     └─ agent.py      ← Gemini + Pinecone + Tavily + 记忆优先 Prompt
     ▼
-SSE 事件流 → 前端打字机（analysis / knowledgePoints / codeExample）
+SSE 事件流 → thinking（路由/检索进度）→ delta 打字机 → 结构化卡片
 ```
 
 | 层级 | 职责 |
 |------|------|
-| **Next.js** | UI、SSE 解析与容错（超时/断流必停 Loading）、结构化卡片 |
-| **FastAPI** | Agent 两阶段路由、RAG、JSON 收敛、异步落库 |
+| **Next.js** | UI、SSE 解析与容错、思考状态区、Markdown 技术分析、数据驱动卡片 |
+| **FastAPI** | Agent 两阶段路由、RAG、thinking 事件注入、伪流式分片（20ms 节流）、异步落库 |
 | **Supabase** | `interviews` / `messages` 表持久化 session 对话 |
 | **scripts/ingest.ts** | Node 向 Pinecone 写入手册向量（与后端共用索引） |
 
 ## 🛠 技术栈与核心基建
 
-- **前端 / BFF**：Next.js 14（App Router） + React 18 + TypeScript + TailwindCSS
+- **前端 / BFF**：Next.js 14（App Router） + React 18 + TypeScript + TailwindCSS + `react-markdown` / `remark-gfm`
 - **AI 核心后端**：Python 3.11+ · FastAPI · Uvicorn
 - **对话记忆**：Supabase（PostgreSQL）· `supabase-py`
 - **AI 编排**：
@@ -56,10 +56,10 @@ SSE 事件流 → 前端打字机（analysis / knowledgePoints / codeExample）
 ```text
 app/
   api/chat/route.ts        # BFF：转发至 FastAPI，透传 SSE
-  page.tsx                 # 聊天 UI + SSE 消费 + session_id（localStorage）
+  page.tsx                 # 聊天 UI、思考链、SSE 消费、Markdown 渲染
 backend/
   main.py                  # FastAPI 入口
-  agent.py                 # Agent + 记忆优先 System Prompt + SSE
+  agent.py                 # Agent + thinking 队列 + 伪流式 SSE 分片
   database.py              # Supabase 单例与读写
   config.py                # 环境变量（兼容根目录 .env.local）
   supabase_schema.sql      # 建表 SQL（在 Supabase 控制台执行）
@@ -177,8 +177,26 @@ npm run dev
 │  429 / 失败 → 降级 JSON，前端不白屏                       │
 └─────────────────────────┬───────────────────────────────┘
                           ▼
-              SSE 推送 → 异步写入 Supabase（user + assistant）
+              thinking 事件（路由/工具进度）→ 伪流式 SSE → 异步写入 Supabase
 ```
+
+### 思考链与流式体验（Thinking Chain）
+
+**后端（`agent.py`）**
+
+- 进入阻塞阶段前推送 `type: thinking`（如「正在分析问题意图并规划检索路由…」）。
+- `run_phases_sync` 通过线程安全队列实时上报：大模型路由、Pinecone 手册检索、Tavily 联网、阶段 B 格式化等步骤。
+- `_stream_answer_payload` 将完整 JSON 按 2 字符分片推送 `delta`，每片 `await asyncio.sleep(0.02)`，避免瞬间倾泻、保障前端打字机节奏。
+
+**前端（`page.tsx`）**
+
+| 阶段 | UI 行为 |
+|------|---------|
+| **思考中**（`thinkingActive`） | 气泡内仅显示顶部思考文案 + 脉冲点，**不挂载**正文 Section，避免空骨架闪烁 |
+| **正文流式** | 收到首个有效 `delta` / `knowledgePoints` 后结束思考动画；各 Section **仅在有真实数据**（`length > 0`）时渲染 |
+| **占位符拦截** | 含 `(无)`、`本题无需`、纯空白等脏数据不触发正文阶段，但照常拼接 `acc`；`done` 时强制结束思考态 |
+
+**技术分析**区块使用 `ReactMarkdown` + `remarkGfm` 渲染 Markdown（列表、表格、加粗等）；知识点与代码示例保持原有样式。
 
 ### 对话记忆（Supabase）
 
@@ -187,21 +205,22 @@ npm run dev
 - 未配置 Supabase 时自动降级，**不影响 Pinecone RAG**  
 - 记忆类问题（姓名、擅长框架等）在 System Prompt 中 **优先于工具路由与安全拒答**
 
-### SSE 与前端容错（`app/page.tsx`）
+### SSE 协议与前端容错（`app/page.tsx`）
 
 | 机制 | 说明 |
 |------|------|
 | 整请求超时 | **30 秒** `AbortController`，超时停止「思考中」 |
-| 解析容错 | 单条 `data:` JSON 失败则跳过，不卡死整流 |
+| 缓冲解析 | `carry` + `\n\n` 分块，单条 JSON 失败则跳过，不中断整流 |
 | 错误事件 | `type: error` → 错误气泡，移除空 AI 占位 |
-| 结束保障 | `finally` 中强制 `setLoading(false)` |
+| 结束保障 | `finally` 中强制 `setLoading(false)`；`done` 必触发思考态收尾 |
 
-| 事件 `type` | 含义 |
-|-------------|------|
-| `delta` | `analysis` / `codeExample` 增量 |
-| `knowledgePoints` | 标签数组 |
-| `done` | 流结束 |
-| `error` | 错误信息 |
+| 事件 `type` | 载荷 | 含义 |
+|-------------|------|------|
+| `thinking` | `{ message: string }` | 路由 / 检索 / 格式化进度（思考状态区） |
+| `delta` | `{ field, text }` | `analysis` / `codeExample` 增量（2 字分片） |
+| `knowledgePoints` | `{ items: string[] }` | 知识点标签（一次性） |
+| `done` | — | 流结束；强制 `thinking.done` |
+| `error` | `{ message }` | 错误信息 |
 
 ### 结构化输出
 
@@ -221,8 +240,11 @@ npm run dev
 
 - **`服务器未配置 GEMINI_API_KEY`**：根目录 `.env.local` 填 Key，重启前后端。  
 - **`无法连接 AI 后端`**：确认 `backend` 在 `8000` 端口运行，或检查 `CHAT_BACKEND_URL`。  
-- **一直「思考中」**：前端已对 SSE 做 30s 超时与 `finally` 复位；仍出现则查后端是否卡住或代理超时。  
-- **记不住姓名/技术栈**：确认 Supabase 已建表、Key 正确，且同一浏览器 `session_id` 未变；日志应有 `loaded N history message(s)`。  
+- **一直「思考中」**：前端已对 SSE 做 30s 超时与 `finally` 复位；`done` 会强制结束思考动画。仍出现则查后端是否卡在工具调用或代理超时。  
+- **无打字机效果、答案瞬间弹出**：确认 `agent.py` 中 `_stream_answer_payload` 使用 `asyncio.sleep(0.02)`，并重启 Python 后端。  
+- **思考结束过早 / 出现「（无）」空卡片**：检查前端 `isPlaceholderDeltaText` / `isPlaceholderKnowledgePoints` 是否误拦真实正文；后端阶段 B 不应输出占位 JSON。  
+- **Markdown 无样式**：`prose` 类需 `@tailwindcss/typography` 插件；未安装时 GFM 结构仍可解析，仅排版较朴素。  
+- **记不住姓名/技术栈**：确认 Supabase 已建表、Key 正确，且同一浏览器 `session_id` 未变；日志应有 `injected N history message(s)`。  
 - **模型仍隐私拒答**：检查 `agent.py` 中 `HISTORY_PRIORITY_INSTRUCTION` 是否生效，并重启 Python。  
 - **Pinecone 无结果**：执行 `npm run ingest`，索引维度 **768**。  
 - **网络不通**：配置 `HTTPS_PROXY`；Python `httpx` 与 Node 均会读取。
