@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, FormEvent } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface InterviewAnswer {
   analysis: string;
@@ -10,14 +12,25 @@ interface InterviewAnswer {
 
 /** 与 backend/agent.py SSE 事件对齐 */
 type SsePayload =
+  | { type: "thinking"; message: string }
   | { type: "delta"; field: "analysis" | "codeExample"; text: string }
   | { type: "knowledgePoints"; items: string[] }
   | { type: "done" }
   | { type: "error"; message?: string };
 
+type AiThinkingState = {
+  message: string;
+  done: boolean;
+};
+
 type Message =
   | { id: string; role: "user"; content: string }
-  | { id: string; role: "ai"; content: InterviewAnswer }
+  | {
+      id: string;
+      role: "ai";
+      content: InterviewAnswer;
+      thinking?: AiThinkingState;
+    }
   | { id: string; role: "error"; content: string };
 
 function uid() {
@@ -72,16 +85,81 @@ type SseConsumeResult = {
  * 消费 SSE 响应体；无论成功/失败/中断，调用方须在 finally 中 setLoading(false)。
  * 等价于对 EventSource 的 onmessage + onerror + onclose 做统一收尾。
  */
+type SseStreamHandlers = {
+  onPartial: (answer: InterviewAnswer) => void;
+  onThinking?: (message: string) => void;
+  /** 首个 delta 到达：进入正文流式阶段 */
+  onBodyStreamStart?: () => void;
+};
+
+function isPlaceholderDeltaText(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  if (t.includes("(无)")) return true;
+  if (t.includes("本题无需")) return true;
+  return false;
+}
+
+function isPlaceholderKnowledgePoints(items: string[]): boolean {
+  if (items.length === 0) return true;
+  return items[0].includes("(无)");
+}
+
 async function consumeChatSseStream(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
-  onPartial: (answer: InterviewAnswer) => void
+  handlers: SseStreamHandlers
 ): Promise<SseConsumeResult> {
+  const { onPartial, onThinking, onBodyStreamStart } = handlers;
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let carry = "";
   let acc: InterviewAnswer = { ...EMPTY_ANSWER };
   let sawDone = false;
+  let sawFirstDelta = false;
+
+  const markBodyStreamStartIfNeeded = () => {
+    if (sawFirstDelta) return;
+    sawFirstDelta = true;
+    onBodyStreamStart?.();
+  };
+
+  /** @returns 是否需要在处理后调用 onPartial */
+  const applyPayload = (payload: SsePayload): boolean => {
+    if (payload.type === "error") {
+      throw new Error(payload.message || "流式响应错误");
+    }
+    if (payload.type === "done") {
+      sawDone = true;
+      markBodyStreamStartIfNeeded();
+      return false;
+    }
+    if (payload.type === "thinking" && payload.message) {
+      onThinking?.(payload.message);
+      return false;
+    }
+    if (payload.type === "delta" && payload.field) {
+      const text = typeof payload.text === "string" ? payload.text : "";
+      if (!isPlaceholderDeltaText(text)) {
+        markBodyStreamStartIfNeeded();
+      }
+      if (payload.field === "analysis") {
+        acc = { ...acc, analysis: acc.analysis + text };
+      } else if (payload.field === "codeExample") {
+        acc = { ...acc, codeExample: acc.codeExample + text };
+      }
+    }
+    if (payload.type === "knowledgePoints" && Array.isArray(payload.items)) {
+      const items = payload.items.filter(
+        (x): x is string => typeof x === "string"
+      );
+      if (!isPlaceholderKnowledgePoints(items)) {
+        markBodyStreamStartIfNeeded();
+      }
+      acc = { ...acc, knowledgePoints: items };
+    }
+    return true;
+  };
 
   const onAbort = () => {
     void reader.cancel().catch(() => undefined);
@@ -110,30 +188,9 @@ async function consumeChatSseStream(
       for (const raw of blocks) {
         const payload = parseSseDataLine(raw);
         if (!payload) continue;
-
-        if (payload.type === "error") {
-          throw new Error(payload.message || "流式响应错误");
+        if (applyPayload(payload)) {
+          onPartial({ ...acc });
         }
-        if (payload.type === "done") {
-          sawDone = true;
-          continue;
-        }
-        if (payload.type === "delta" && payload.field && payload.text) {
-          if (payload.field === "analysis") {
-            acc = { ...acc, analysis: acc.analysis + payload.text };
-          } else if (payload.field === "codeExample") {
-            acc = { ...acc, codeExample: acc.codeExample + payload.text };
-          }
-        }
-        if (payload.type === "knowledgePoints" && Array.isArray(payload.items)) {
-          acc = {
-            ...acc,
-            knowledgePoints: payload.items.filter(
-              (x): x is string => typeof x === "string"
-            ),
-          };
-        }
-        onPartial({ ...acc });
       }
     }
 
@@ -143,26 +200,7 @@ async function consumeChatSseStream(
 
     if (carry.trim()) {
       const tail = parseSseDataLine(carry);
-      if (tail) {
-        if (tail.type === "error") {
-          throw new Error(tail.message || "流式响应错误");
-        }
-        if (tail.type === "done") sawDone = true;
-        if (tail.type === "delta" && tail.field && tail.text) {
-          if (tail.field === "analysis") {
-            acc = { ...acc, analysis: acc.analysis + tail.text };
-          } else if (tail.field === "codeExample") {
-            acc = { ...acc, codeExample: acc.codeExample + tail.text };
-          }
-        }
-        if (tail.type === "knowledgePoints" && Array.isArray(tail.items)) {
-          acc = {
-            ...acc,
-            knowledgePoints: tail.items.filter(
-              (x): x is string => typeof x === "string"
-            ),
-          };
-        }
+      if (tail && applyPayload(tail)) {
         onPartial({ ...acc });
       }
     }
@@ -255,7 +293,12 @@ export default function HomePage() {
         streamingAiId = aiId;
         setMessages((prev) => [
           ...prev,
-          { id: aiId, role: "ai", content: { ...EMPTY_ANSWER } },
+          {
+            id: aiId,
+            role: "ai",
+            content: { ...EMPTY_ANSWER },
+            thinking: { message: "正在连接面试官…", done: false },
+          },
         ]);
 
         const updateAiBubble = (answer: InterviewAnswer) => {
@@ -268,12 +311,35 @@ export default function HomePage() {
           );
         };
 
+        const updateThinking = (message: string) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiId && m.role === "ai"
+                ? {
+                    ...m,
+                    thinking: { message, done: m.thinking?.done ?? false },
+                  }
+                : m
+            )
+          );
+        };
+
+        const startBodyStream = () => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiId && m.role === "ai" && m.thinking
+                ? { ...m, thinking: { ...m.thinking, done: true } }
+                : m
+            )
+          );
+        };
+
         /* onerror → 抛至外层 catch；onclose → consume 内部 reader 释放 */
-        const streamResult = await consumeChatSseStream(
-          res.body,
-          abortController.signal,
-          updateAiBubble
-        );
+        const streamResult = await consumeChatSseStream(res.body, abortController.signal, {
+          onPartial: updateAiBubble,
+          onThinking: updateThinking,
+          onBodyStreamStart: startBodyStream,
+        });
 
         const { answer, sawDone } = streamResult;
         updateAiBubble(answer);
@@ -352,7 +418,7 @@ export default function HomePage() {
             <MessageBubble key={m.id} message={m} />
           ))}
 
-          {loading && <LoadingBubble />}
+          {loading && messages.at(-1)?.role === "user" && <LoadingBubble />}
         </div>
       </div>
 
@@ -446,46 +512,98 @@ function MessageBubble({ message }: { message: Message }) {
     );
   }
 
-  return <AnswerCard answer={message.content} />;
+  return (
+    <AnswerCard answer={message.content} thinking={message.thinking} />
+  );
 }
 
-function AnswerCard({ answer }: { answer: InterviewAnswer }) {
+function AnswerCard({
+  answer,
+  thinking,
+}: {
+  answer: InterviewAnswer;
+  thinking?: AiThinkingState;
+}) {
+  const hasBody =
+    answer.analysis.length > 0 ||
+    answer.knowledgePoints.length > 0 ||
+    answer.codeExample.length > 0;
+  const thinkingActive = Boolean(
+    thinking && !thinking.done && thinking.message
+  );
+
   return (
     <div className="flex justify-start">
-      <div className="w-full max-w-[92%] space-y-3 rounded-2xl rounded-bl-sm border border-gray-200 bg-white p-4 shadow-sm">
-        <Section title="技术分析" icon="A">
-          <p className="text-sm leading-relaxed text-gray-800">
-            {answer.analysis || "（无）"}
-          </p>
-        </Section>
+      <div
+        className={`w-full max-w-[92%] rounded-2xl rounded-bl-sm border border-gray-200 bg-white shadow-sm ${
+          hasBody ? "space-y-3 p-4" : "px-4 py-3"
+        }`}
+      >
+        {thinkingActive && thinking ? (
+          <ThinkingStatus thinking={thinking} compact={!hasBody} />
+        ) : (
+          <>
+            {answer.analysis.length > 0 && (
+              <Section title="技术分析" icon="A">
+                <div className="prose prose-sm max-w-none text-gray-800 leading-relaxed">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {answer.analysis}
+                  </ReactMarkdown>
+                </div>
+              </Section>
+            )}
 
-        <Section title="核心知识点" icon="K">
-          {answer.knowledgePoints.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5">
-              {answer.knowledgePoints.map((kp, i) => (
-                <span
-                  key={i}
-                  className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-0.5 text-xs text-gray-700"
-                >
-                  {kp}
-                </span>
-              ))}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-400">（无）</p>
-          )}
-        </Section>
+            {answer.knowledgePoints.length > 0 && (
+              <Section title="核心知识点" icon="K">
+                <div className="flex flex-wrap gap-1.5">
+                  {answer.knowledgePoints.map((kp, i) => (
+                    <span
+                      key={i}
+                      className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-0.5 text-xs text-gray-700"
+                    >
+                      {kp}
+                    </span>
+                  ))}
+                </div>
+              </Section>
+            )}
 
-        <Section title="代码示例" icon="C">
-          {answer.codeExample?.trim() ? (
-            <pre className="overflow-x-auto rounded-lg bg-gray-900 p-3 text-xs leading-relaxed text-gray-100">
-              <code>{answer.codeExample}</code>
-            </pre>
-          ) : (
-            <p className="text-sm text-gray-400">（本题无需代码示例）</p>
-          )}
-        </Section>
+            {answer.codeExample.length > 0 && (
+              <Section title="代码示例" icon="C">
+                <pre className="overflow-x-auto rounded-lg bg-gray-900 p-3 text-xs leading-relaxed text-gray-100">
+                  <code>{answer.codeExample}</code>
+                </pre>
+              </Section>
+            )}
+          </>
+        )}
       </div>
+    </div>
+  );
+}
+
+function ThinkingStatus({
+  thinking,
+  compact = false,
+}: {
+  thinking: AiThinkingState;
+  compact?: boolean;
+}) {
+  if (thinking.done) return null;
+
+  return (
+    <div
+      className={`flex items-start gap-2 ${
+        compact ? "" : "border-b border-gray-100 pb-2"
+      }`}
+    >
+      <span
+        className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-gray-400 opacity-80 motion-safe:animate-pulse"
+        aria-hidden
+      />
+      <p className="text-[11px] leading-relaxed text-gray-500">
+        {thinking.message}
+      </p>
     </div>
   );
 }

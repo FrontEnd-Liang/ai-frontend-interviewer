@@ -11,8 +11,9 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -259,10 +260,26 @@ def _interview_to_dict(obj: InterviewResponse | dict[str, Any]) -> dict[str, Any
     }
 
 
+_TOOL_THINKING_LABELS: dict[str, str] = {
+    "search_frontend_handbook": "正在检索本地 React / 前端手册…",
+    "internet_search": "正在联网检索实时资讯（Tavily）…",
+}
+
+
+def _emit_thinking(
+    emit: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if emit is not None:
+        emit(message)
+
+
 def run_phases_sync(
     message: str,
     settings: Settings,
     history: list[HistoryMessage] | None = None,
+    *,
+    on_thinking: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Blocking: stage A (tools) + stage B (structured JSON). Returns camelCase dict."""
     embeddings = Gemini768Embeddings(settings)
@@ -321,6 +338,7 @@ def run_phases_sync(
     ]
     if history:
         logger.info("[/chat] injected %s history message(s) into router context", len(history))
+    _emit_thinking(on_thinking, "正在调用大模型分析意图与工具路由…")
     ai_msg: AIMessage = model_with_tools.invoke(router_messages)
 
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
@@ -338,6 +356,11 @@ def run_phases_sync(
                 continue
             called_tools.append(name)
             args = _tool_call_args(tc)
+            tool_label = _TOOL_THINKING_LABELS.get(name)
+            if tool_label:
+                _emit_thinking(on_thinking, tool_label)
+            else:
+                _emit_thinking(on_thinking, f"正在执行工具 {name}…")
             try:
                 out = matched.invoke(args)
                 raw_content = out.content if isinstance(out, ToolMessage) else out
@@ -377,6 +400,7 @@ def run_phases_sync(
     if has_history:
         formatter_system = f"{HISTORY_PRIORITY_INSTRUCTION}\n\n{FORMATTER_SYSTEM_PROMPT}"
 
+    _emit_thinking(on_thinking, "正在整理检索结果并生成结构化回答…")
     try:
         final_result = structured_model.invoke(
             [
@@ -410,6 +434,47 @@ def run_phases_sync(
     return safe
 
 
+async def _run_phases_with_thinking_stream(
+    message: str,
+    settings: Settings,
+    history: list[HistoryMessage],
+) -> AsyncIterator[str | dict[str, Any]]:
+    """
+    Run blocking phases in a thread; yield thinking SSE lines from a queue,
+    then yield the final payload dict once.
+    """
+    thinking_q: queue.Queue[str] = queue.Queue()
+
+    def on_thinking(msg: str) -> None:
+        thinking_q.put(msg)
+
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(
+        None,
+        lambda: run_phases_sync(
+            message, settings, history, on_thinking=on_thinking
+        ),
+    )
+
+    while not future.done():
+        while True:
+            try:
+                msg = thinking_q.get_nowait()
+            except queue.Empty:
+                break
+            yield _sse({"type": "thinking", "message": msg})
+        await asyncio.sleep(0.03)
+
+    while True:
+        try:
+            msg = thinking_q.get_nowait()
+        except queue.Empty:
+            break
+        yield _sse({"type": "thinking", "message": msg})
+
+    yield await future
+
+
 def _sse(obj: dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
@@ -427,14 +492,14 @@ async def _stream_answer_payload(payload: dict[str, Any]) -> AsyncIterator[str]:
 
     for chunk in _iter_text_chunks(analysis, 2):
         yield _sse({"type": "delta", "field": "analysis", "text": chunk})
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.02)
 
     if isinstance(kps, list) and kps:
         yield _sse({"type": "knowledgePoints", "items": [str(x) for x in kps]})
 
     for chunk in _iter_text_chunks(code, 2):
         yield _sse({"type": "delta", "field": "codeExample", "text": chunk})
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.02)
 
     yield _sse({"type": "done"})
 
@@ -506,7 +571,20 @@ async def chat_sse(
         history = await asyncio.to_thread(db.fetch_recent_messages, sid)
 
     try:
-        safe = await asyncio.to_thread(run_phases_sync, message, settings, history)
+        yield _sse(
+            {
+                "type": "thinking",
+                "message": "正在分析问题意图并规划检索路由…",
+            }
+        )
+        safe: dict[str, Any] | None = None
+        async for item in _run_phases_with_thinking_stream(message, settings, history):
+            if isinstance(item, str):
+                yield item
+            else:
+                safe = item
+        if safe is None:
+            raise RuntimeError("run_phases_sync 未返回有效结果")
     except Exception as e:
         logger.exception("[/chat] error")
         yield _sse(
